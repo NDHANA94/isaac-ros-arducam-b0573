@@ -682,6 +682,24 @@ void ArducamDualCamNode::init_nvbuf_surfaces()
     return;  // use_nvbuf_ stays false
   }
 
+  // ── BGRA surfaces for image_raw (VIC NV12→BGRA hardware colour conversion) ──
+  // VIC converts NV12→BGRA in the same crop pass — no CPU cvtColor or stride
+  // memcpy needed.  mappedAddr.addr[0] is directly usable as a cv::Mat pointer.
+  NvBufSurfaceCreateParams raw_params = params;
+  raw_params.colorFormat = NVBUF_COLOR_FORMAT_BGRA;   // packed 4-channel, 1 plane
+
+  int ret_rl = NvBufSurfaceCreate(&nvbuf_raw_left_,  1, &raw_params);
+  int ret_rr = NvBufSurfaceCreate(&nvbuf_raw_right_, 1, &raw_params);
+
+  if (ret_rl != 0 || ret_rr != 0) {
+    RCLCPP_WARN(get_logger(),
+      "NvBufSurfaceCreate (BGRA/SURFACE_ARRAY) failed (ret_l=%d ret_r=%d)"
+      " — image_raw will use CPU cvtColor fallback", ret_rl, ret_rr);
+    if (nvbuf_raw_left_)  { NvBufSurfaceDestroy(nvbuf_raw_left_);  nvbuf_raw_left_  = nullptr; }
+    if (nvbuf_raw_right_) { NvBufSurfaceDestroy(nvbuf_raw_right_); nvbuf_raw_right_ = nullptr; }
+    // Don't return — NV12 NITROS path still works; raw fallback handled in process_sample_nvbuf
+  }
+
   // Map the SURFACE_ARRAY buffers for CPU access.
   // planeIdx=-1  → map ALL planes at once (Y = addr[0], UV = addr[1] for NV12).
   //   planeIdx=0 would leave addr[1] null → std::memcpy on the UV plane SEGFAULTs.
@@ -690,10 +708,24 @@ void ArducamDualCamNode::init_nvbuf_surfaces()
   if (NvBufSurfaceMap(nvbuf_left_,  0, -1, NVBUF_MAP_READ_WRITE) != 0 ||
       NvBufSurfaceMap(nvbuf_right_, 0, -1, NVBUF_MAP_READ_WRITE) != 0) {
     RCLCPP_WARN(get_logger(),
-      "NvBufSurfaceMap failed — VIC path disabled");
+      "NvBufSurfaceMap (NV12) failed — VIC path disabled");
     NvBufSurfaceDestroy(nvbuf_left_);  nvbuf_left_  = nullptr;
     NvBufSurfaceDestroy(nvbuf_right_); nvbuf_right_ = nullptr;
+    if (nvbuf_raw_left_)  { NvBufSurfaceDestroy(nvbuf_raw_left_);  nvbuf_raw_left_  = nullptr; }
+    if (nvbuf_raw_right_) { NvBufSurfaceDestroy(nvbuf_raw_right_); nvbuf_raw_right_ = nullptr; }
     return;
+  }
+
+  // Map BGRA surfaces (single plane, planeIdx=-1 == 0 for packed formats, but
+  // -1 is safe and consistent).
+  if (nvbuf_raw_left_ && nvbuf_raw_right_) {
+    if (NvBufSurfaceMap(nvbuf_raw_left_,  0, -1, NVBUF_MAP_READ_WRITE) != 0 ||
+        NvBufSurfaceMap(nvbuf_raw_right_, 0, -1, NVBUF_MAP_READ_WRITE) != 0) {
+      RCLCPP_WARN(get_logger(),
+        "NvBufSurfaceMap (BGRA) failed — image_raw will use CPU cvtColor fallback");
+      NvBufSurfaceDestroy(nvbuf_raw_left_);  nvbuf_raw_left_  = nullptr;
+      NvBufSurfaceDestroy(nvbuf_raw_right_); nvbuf_raw_right_ = nullptr;
+    }
   }
 
   // Allocate packed NV12 CUDA device buffers (Y plane + interleaved UV plane).
@@ -720,16 +752,17 @@ void ArducamDualCamNode::init_nvbuf_surfaces()
 
   use_nvbuf_ = true;
   RCLCPP_INFO(get_logger(),
-    "NvBufSurface NITROS path ready  dst_fmt=NV12/SURFACE_ARRAY  eye=%dx%d"
-    "  cuda_nv12_left=%p  cuda_nv12_right=%p  buf_size=%zu bytes",
+    "NvBufSurface ready  eye=%dx%d"
+    "  NV12(NITROS): cuda_left=%p cuda_right=%p  buf=%zu B"
+    "  BGRA(image_raw): %s",
     eye_width(), combined_height_,
-    cuda_nv12_left_, cuda_nv12_right_, nv12_size);
+    cuda_nv12_left_, cuda_nv12_right_, nv12_size,
+    (nvbuf_raw_left_ && nvbuf_raw_right_) ? "VIC hw path" : "CPU cvtColor fallback");
 }
 
 // ── cleanup_nvbuf_surfaces() ──────────────────────────────────────────────────
 void ArducamDualCamNode::cleanup_nvbuf_surfaces()
 {
-  // Unmap SURFACE_ARRAY CPU mappings created in init_nvbuf_surfaces().
   if (nvbuf_left_) {
     NvBufSurfaceUnMap(nvbuf_left_,  0, -1);
     NvBufSurfaceDestroy(nvbuf_left_);
@@ -740,7 +773,16 @@ void ArducamDualCamNode::cleanup_nvbuf_surfaces()
     NvBufSurfaceDestroy(nvbuf_right_);
     nvbuf_right_ = nullptr;
   }
-  // Free CUDA staging buffers allocated in init_nvbuf_surfaces().
+  if (nvbuf_raw_left_) {
+    NvBufSurfaceUnMap(nvbuf_raw_left_,  0, -1);
+    NvBufSurfaceDestroy(nvbuf_raw_left_);
+    nvbuf_raw_left_ = nullptr;
+  }
+  if (nvbuf_raw_right_) {
+    NvBufSurfaceUnMap(nvbuf_raw_right_, 0, -1);
+    NvBufSurfaceDestroy(nvbuf_raw_right_);
+    nvbuf_raw_right_ = nullptr;
+  }
   if (cuda_nv12_left_)  { cudaFree(cuda_nv12_left_);  cuda_nv12_left_  = nullptr; }
   if (cuda_nv12_right_) { cudaFree(cuda_nv12_right_); cuda_nv12_right_ = nullptr; }
   use_nvbuf_ = false;
@@ -796,23 +838,53 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
   auto err_l = NvBufSurfTransformAsync(src, nvbuf_left_,  &tp_left,  &sync_left);
   auto err_r = NvBufSurfTransformAsync(src, nvbuf_right_, &tp_right, &sync_right);
 
+  // ── image_raw VIC path: NV12→BGRA crop in the same hardware pass ───────────
+  // Kick off both BGRA transforms before waiting on ANY sync object so all four
+  // VIC jobs run concurrently.  sync_raw_* are only used if nvbuf_raw_* allocated.
+  const bool want_raw = pub_raw_left_ || pub_raw_right_;
+  const bool have_raw_surfs = nvbuf_raw_left_ && nvbuf_raw_right_;
+  NvBufSurfTransformSyncObj_t sync_raw_left  = nullptr;
+  NvBufSurfTransformSyncObj_t sync_raw_right = nullptr;
+
+  if (want_raw && have_raw_surfs) {
+    // FILTER flag is required when color format differs between src and dst so
+    // VIC applies the colour matrix in the same pass as the crop.
+    NvBufSurfTransformParams tp_raw_left  = tp_left;
+    NvBufSurfTransformParams tp_raw_right = tp_right;
+    tp_raw_left.transform_flag  |= NVBUFSURF_TRANSFORM_FILTER;
+    tp_raw_right.transform_flag |= NVBUFSURF_TRANSFORM_FILTER;
+    NvBufSurfTransformAsync(src, nvbuf_raw_left_,  &tp_raw_left,  &sync_raw_left);
+    NvBufSurfTransformAsync(src, nvbuf_raw_right_, &tp_raw_right, &sync_raw_right);
+  }
+
   if (err_l != NvBufSurfTransformError_Success ||
       err_r != NvBufSurfTransformError_Success)
   {
     RCLCPP_WARN_ONCE(get_logger(),
-      "NvBufSurfTransformAsync failed (err_l=%d err_r=%d) — "
+      "NvBufSurfTransformAsync (NV12) failed (err_l=%d err_r=%d) — "
       "disabling VIC path", static_cast<int>(err_l), static_cast<int>(err_r));
-    if (sync_left)  NvBufSurfTransformSyncObjDestroy(&sync_left);
-    if (sync_right) NvBufSurfTransformSyncObjDestroy(&sync_right);
+    if (sync_left)       NvBufSurfTransformSyncObjDestroy(&sync_left);
+    if (sync_right)      NvBufSurfTransformSyncObjDestroy(&sync_right);
+    if (sync_raw_left)   NvBufSurfTransformSyncObjDestroy(&sync_raw_left);
+    if (sync_raw_right)  NvBufSurfTransformSyncObjDestroy(&sync_raw_right);
     gst_buffer_unmap(buf, &map);
     use_nvbuf_ = false;
     return false;
   }
 
+  // Wait for all VIC jobs — NV12 (NITROS) and BGRA (image_raw) run concurrently
   NvBufSurfTransformSyncObjWait(sync_left,  -1);
   NvBufSurfTransformSyncObjWait(sync_right, -1);
   NvBufSurfTransformSyncObjDestroy(&sync_left);
   NvBufSurfTransformSyncObjDestroy(&sync_right);
+  if (sync_raw_left)  {
+    NvBufSurfTransformSyncObjWait(sync_raw_left,  -1);
+    NvBufSurfTransformSyncObjDestroy(&sync_raw_left);
+  }
+  if (sync_raw_right) {
+    NvBufSurfTransformSyncObjWait(sync_raw_right, -1);
+    NvBufSurfTransformSyncObjDestroy(&sync_raw_right);
+  }
 
   gst_buffer_unmap(buf, &map);  // release NVMM src reference; dst is independent
 
@@ -824,8 +896,13 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
   // SURFACE_ARRAY has padding per-plane) into pre-allocated cudaMalloc buffers.
   // On Jetson iGPU (unified LPDDR5) this is coherence-bookkeeping, not a real
   // DMA copy — the physical pages are the same.
+  // Sync CPU view: NV12 surfaces (for cudaMemcpy2D) and BGRA surfaces (for cv::Mat wrap)
   NvBufSurfaceSyncForCpu(nvbuf_left_,  0, 0);
   NvBufSurfaceSyncForCpu(nvbuf_right_, 0, 0);
+  if (have_raw_surfs && want_raw) {
+    NvBufSurfaceSyncForCpu(nvbuf_raw_left_,  0, 0);
+    NvBufSurfaceSyncForCpu(nvbuf_raw_right_, 0, 0);
+  }
 
   // Copy NV12 planes (with stride removal) into packed cudaMalloc buffer.
   // dst layout: [Y: ew*h bytes][UV: ew*(h/2) bytes] — stride == ew (no padding).
@@ -866,37 +943,50 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
   pub_cam_info(pub_left_info_,  cam_info_left_,  frame_id_left_);
   pub_cam_info(pub_right_info_, cam_info_right_, frame_id_right_);
 
-  // ── Raw sensor_msgs/Image (rviz2) — only when publish_image_raw is enabled ─
-  // Convert CPU-mapped NV12 SURFACE_ARRAY → packed NV12 → BGR8.
-  // NvBufSurfaceSyncForCpu() above already ensured mappedAddr is coherent.
-  // The memcpy removes per-row HW padding so cv::cvtColor sees a packed buffer.
-  auto nv12_to_bgr_mat = [&](NvBufSurface * surf, int w, int h) -> cv::Mat {
-    auto * y_src  = static_cast<const uint8_t *>(surf->surfaceList[0].mappedAddr.addr[0]);
-    auto * uv_src = static_cast<const uint8_t *>(surf->surfaceList[0].mappedAddr.addr[1]);
-    const size_t pitch_y  = surf->surfaceList[0].planeParams.pitch[0];
-    const size_t pitch_uv = surf->surfaceList[0].planeParams.pitch[1];
-    std::vector<uint8_t> nv12_buf(static_cast<size_t>(w * h * 3 / 2));
-    for (int r = 0; r < h; ++r) {
-      std::memcpy(nv12_buf.data() + r * w, y_src  + r * pitch_y,  static_cast<size_t>(w));
-    }
-    for (int r = 0; r < h / 2; ++r) {
-      std::memcpy(nv12_buf.data() + w * h + r * w, uv_src + r * pitch_uv,
-                  static_cast<size_t>(w));
-    }
-    cv::Mat nv12_mat(h * 3 / 2, w, CV_8UC1, nv12_buf.data());
-    cv::Mat bgr_mat;
-    cv::cvtColor(nv12_mat, bgr_mat, cv::COLOR_YUV2BGR_NV12);
-    return bgr_mat;   // bgr_mat owns its own data — nv12_buf can go out of scope
-  };
-
+  // ── Raw sensor_msgs/Image (rviz2) ─────────────────────────────────────────
+  // VIC hw path (preferred): nvbuf_raw_{left,right}_ already contain BGRA data
+  // from the async transform above. mappedAddr.addr[0] is directly usable as a
+  // cv::Mat — no heap allocation, no memcpy, no cvtColor loop.
+  //
+  // CPU fallback (if BGRA surfaces weren't allocated): de-stride the NV12
+  // SURFACE_ARRAY and run cv::cvtColor — same as the original path.
   auto publish_raw_side = [&](
-    NvBufSurface * surf,
+    NvBufSurface * bgra_surf,        // null → CPU fallback
+    NvBufSurface * nv12_surf,        // used for CPU fallback only
     rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr & pub,
     const std::string & frame_id,
     int out_w, int out_h)
   {
-    cv::Mat bgr = nv12_to_bgr_mat(surf, ew, combined_height_);
-    // Resize only if a different output resolution is requested
+    cv::Mat bgr;
+
+    if (bgra_surf) {
+      // ── VIC path: wrap BGRA directly, convert BGRA→BGR (single NEON pass) ──
+      auto * bgra_ptr = static_cast<uint8_t *>(
+        bgra_surf->surfaceList[0].mappedAddr.addr[0]);
+      const size_t pitch = bgra_surf->surfaceList[0].planeParams.pitch[0];
+      cv::Mat bgra_mat(combined_height_, ew, CV_8UC4, bgra_ptr, pitch);
+      cv::cvtColor(bgra_mat, bgr, cv::COLOR_BGRA2BGR);  // drops X channel; NEON-vectorised
+    } else {
+      // ── CPU fallback: de-stride NV12 + cvtColor ────────────────────────────
+      auto * y_src  = static_cast<const uint8_t *>(
+        nv12_surf->surfaceList[0].mappedAddr.addr[0]);
+      auto * uv_src = static_cast<const uint8_t *>(
+        nv12_surf->surfaceList[0].mappedAddr.addr[1]);
+      const size_t pitch_y  = nv12_surf->surfaceList[0].planeParams.pitch[0];
+      const size_t pitch_uv = nv12_surf->surfaceList[0].planeParams.pitch[1];
+      std::vector<uint8_t> nv12_buf(static_cast<size_t>(ew * combined_height_ * 3 / 2));
+      for (int r = 0; r < combined_height_; ++r) {
+        std::memcpy(nv12_buf.data() + r * ew, y_src + r * pitch_y,
+                    static_cast<size_t>(ew));
+      }
+      for (int r = 0; r < combined_height_ / 2; ++r) {
+        std::memcpy(nv12_buf.data() + ew * combined_height_ + r * ew,
+                    uv_src + r * pitch_uv, static_cast<size_t>(ew));
+      }
+      cv::Mat nv12_mat(combined_height_ * 3 / 2, ew, CV_8UC1, nv12_buf.data());
+      cv::cvtColor(nv12_mat, bgr, cv::COLOR_YUV2BGR_NV12);
+    }
+
     if (out_w != bgr.cols || out_h != bgr.rows) {
       cv::resize(bgr, bgr, cv::Size(out_w, out_h));
     }
@@ -906,10 +996,12 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
     pub->publish(std::make_unique<sensor_msgs::msg::Image>(std::move(*img_msg)));
   };
 
-  if (pub_raw_left_)  publish_raw_side(nvbuf_left_,  pub_left_raw_,
-                        frame_id_left_,  eff_out_w(true),  eff_out_h(true));
-  if (pub_raw_right_) publish_raw_side(nvbuf_right_, pub_right_raw_,
-                        frame_id_right_, eff_out_w(false), eff_out_h(false));
+  if (pub_raw_left_)
+    publish_raw_side(have_raw_surfs ? nvbuf_raw_left_  : nullptr, nvbuf_left_,
+                     pub_left_raw_,  frame_id_left_,  eff_out_w(true),  eff_out_h(true));
+  if (pub_raw_right_)
+    publish_raw_side(have_raw_surfs ? nvbuf_raw_right_ : nullptr, nvbuf_right_,
+                     pub_right_raw_, frame_id_right_, eff_out_w(false), eff_out_h(false));
 
   // ── NITROS publish (GPU-resident zero-copy) ───────────────────────────────
   // cuda_nv12_left_/right_ are real cudaMalloc device pointers for downstream

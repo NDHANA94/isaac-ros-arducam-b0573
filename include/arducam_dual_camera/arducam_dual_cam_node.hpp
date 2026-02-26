@@ -179,8 +179,18 @@ private:
   nvidia::isaac_ros::nitros::NitrosContext nitros_ctx_;
 
   bool           use_nvbuf_{false};       // true once surfaces allocated successfully
-  NvBufSurface * nvbuf_left_{nullptr};    // NV12 SURFACE_ARRAY VIC dst, left eye
-  NvBufSurface * nvbuf_right_{nullptr};   // NV12 SURFACE_ARRAY VIC dst, right eye
+
+  // NV12 SURFACE_ARRAY VIC dst — used for NITROS zero-copy publish path.
+  NvBufSurface * nvbuf_left_{nullptr};
+  NvBufSurface * nvbuf_right_{nullptr};
+
+  // BGRA SURFACE_ARRAY VIC dst — used for image_raw (rviz2) publish path.
+  // VIC converts NV12→BGRA in the same hardware pass as the crop, so the CPU
+  // never runs cvtColor or a stride-removal memcpy loop.
+  // mappedAddr.addr[0] is a packed BGRA row-major pointer (pitch from planeParams)
+  // that can be wrapped directly as cv::Mat(h, w, CV_8UC4, addr, pitch) — zero alloc.
+  NvBufSurface * nvbuf_raw_left_{nullptr};
+  NvBufSurface * nvbuf_raw_right_{nullptr};
   // Packed NV12 CUDA device buffers (cudaMalloc eye_w×h×3/2 bytes each).
   // After each VIC transform, cudaMemcpy2D copies Y+UV from the CPU-mapped
   // SURFACE_ARRAY into these, then NitrosImageBuilder::WithGpuData() wraps them.
