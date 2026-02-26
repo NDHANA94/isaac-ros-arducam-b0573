@@ -20,63 +20,70 @@ arducam_dual_cam_node:
 
     # ================================================
     # -------------- LEFT CAMERA CONFIG --------------
-    
-    cam_left:
-      # Camera frame id
+
+    left_camera:
       frame_id: "left_camera"
-      # ROS topic name to publish the left camera's Image and CameraInfo messages on.
-      topic_name_prefix: "/arducam/left"
-      # Publish sensor_msgs/Image (bgr8) on <prefix>/image_raw for rviz2 / plain subscribers.
-      # Set to false to save CPU & bandwidth when only NITROS consumers are downstream.
-      publish_image_raw: true
-      # NITROS image format for the GPU-resident zero-copy topic (HAVE_NVBUF builds only).
-      # Published as: <prefix>/nitros_image_<format>
-      # Supported: "nv12" (native VIC output, lowest bandwidth), "rgb8", "bgr8"
-      nitros_format: "nv12"
-      # QoS for sensor_msgs/Image  (<prefix>/image_raw)
-      raw_qos:
-        reliability: "best_effort"    # reliable | best_effort
-        durability: "volatile"     # volatile | transient_local
-      # QoS for sensor_msgs/CameraInfo  (<prefix>/camera_info)
-      info_qos:
-        reliability: "reliable"
-        durability: "volatile"
-      # QoS for NitrosImage  (<prefix>/nitros_image_<format>)  — HAVE_NVBUF builds only
-      nitros_qos:
-        reliability: "best_effort" # NITROS zero-copy works well with best_effort
-        durability: "volatile"
-      # publihsed image resolution. -1 if same as input (default)
-      output_resolution:
-        width: -1
-        height: -1
-      
-      # Extrinsics of the camera relative to the specified TF frame (e.g. "base_link"). 
+
+      topics:
+        topic_name_prefix: "/arducam/left"
+
+        visual_stream:
+          enable: true
+          transport: "compressed"         # raw | compressed
+          encoding: "bgr8"                # bgr8 | rgb8
+          jpeg_quality: 80                # 0-100        (only used when transport=compressed)
+          qos:
+            reliability: "best_effort"    # reliable | best_effort
+            durability: "volatile"        # volatile | transient_local
+          fps: 30                         # Target frame rate for publishing the visual stream. Actual frame rate may be lower if the camera cannot keep up.    
+          resolution:                     # Resolution for the visual stream. If width or height is set to -1, it will use the full capture resolution for that dimension.    
+            width: -1                     # -1 = same as capture resolution
+            height: -1
+
+        nitros_image:
+          enable: true
+          qos:
+            reliability: "best_effort"   # NITROS zero-copy works well with best_effort
+            durability: "volatile"       # volatile | transient_local
+          format: "nv12"                 # Supported: "nv12" (native VIC output, lowest bandwidth), "nv24", "rgb8", "bgr8"
+          fps: 30                        # Target frame rate for publishing the NITROS image stream. Actual frame rate may be lower if the camera cannot keep up.          
+          resolution:                    # Resolution for the NITROS image stream. If width or height is set to -1, it will use the full capture resolution for that dimension.
+            width: -1
+            height: -1
+
+        camera_info:
+          qos:
+            reliability: "reliable"
+            durability: "volatile"
+          fps: 30
+
+      # Extrinsics of the camera relative to the specified TF frame (e.g. "base_link").
       # These are PLACEHOLDER values; replace with your actual measurements or stereo calibration results.
       extrinsics:
-        relative_to: "base_link" # TF frame that the extrinsics are relative to (e.g. "base_link" or "left_camera")
-        rotation: [0.0, 0.0, 0.0] # Roll, pitch, yaw in degrees
-        translation: [0.0, 0.0, 0.0] # X, Y, Z in metres
+        relative_to: "base_link"        # TF frame that the extrinsics are relative to
+        rotation: [0.0, 0.0, 0.0]       # Roll, pitch, yaw in degrees
+        translation: [0.0, 0.0, 0.0]    # X, Y, Z in metres
 
-      # Intrinsic parameters and calibration for the left camera. 
+      # Intrinsic parameters and calibration for the left camera.
       # These are PLACEHOLDER values; replace with your actual calibration results.
       intrinsics:
         fx: 899.8
         fy: 899.6
         cx: 641.4
         cy: 360.1
-        distortion_model: "plumb_bob" # options: "plumb_bob", "rational_polynomial", "thin_prism_fisheye"
-                                            # plumb_bob: use this if the camera has significant radial distortion (e.g. wide-angle lens)
-                                            # rational_polynomial: use this if the camera has significant tangential distortion (e.g. misaligned lens elements)
-                                            # thin_prism_fisheye: use this if the camera has significant thin prism distortion (e.g. fisheye lens)
+        distortion_model: "plumb_bob"   # plumb_bob | rational_polynomial | thin_prism_fisheye
+                                        # plumb_bob: use this if the camera has significant radial distortion (e.g. wide-angle lens)
+                                        # rational_polynomial: use this if the camera has significant tangential distortion (e.g. misaligned lens elements)
+                                        # thin_prism_fisheye: use this if the camera has significant thin prism distortion (e.g. fisheye lens)
         distortion_coefficients: [-0.3185, 0.1098, 0.0005, -0.0004, 0.0000]
-        # Rectification matrix (R) — rotation that aligns the right camera to the
-        # common rectified frame.  Identity here; replace with stereo calibration output.
-        reflection_matrix: 
+        # Rectification matrix (R) — rotation that aligns the right camera to the common rectified frame.
+        # Identity here; replace with stereo calibration output.
+        reflection_matrix:
           rows: 3
           cols: 3
           data: [1.0, 0.0, 0.0,
-                 0.0, 1.0, 0.0,
-                 0.0, 0.0, 1.0] 
+                  0.0, 1.0, 0.0,
+                  0.0, 0.0, 1.0]
         # Projection matrix (P): [fx'  0  cx'  Tx; 0  fy'  cy'  Ty; 0  0  1  0]
         # For the right camera of a stereo pair, Tx = -fx' * baseline (in metres).
         # Example: 120 mm baseline → Tx = -900.5 * 0.120 = -108.06
@@ -84,70 +91,80 @@ arducam_dual_cam_node:
           rows: 3
           cols: 4
           data: [900.5,   0.0, 638.2,    0.0,
-                   0.0, 900.3, 358.7,    0.0,
-                   0.0,   0.0,   1.0,    0.0]
-
+                    0.0, 900.3, 358.7,    0.0,
+                    0.0,   0.0,   1.0,    0.0]
 
 
     # ================================================
     # -------------- RIGHT CAMERA CONFIG --------------
 
-    cam_right:
-      frame_id: "right_camera"
-      # ROS topic name to publish the right camera's Image and CameraInfo messages on.
-      topic_name_prefix: "/arducam/right"
-      # Publish sensor_msgs/Image (bgr8) on <prefix>/image_raw for rviz2 / plain subscribers.
-      # Set to false to save CPU & bandwidth when only NITROS consumers are downstream.
-      publish_image_raw: true
-      # NITROS image format for the GPU-resident zero-copy topic (HAVE_NVBUF builds only).
-      # Published as: <prefix>/nitros_image_<format>
-      # Supported: "nv12" (native VIC output, lowest bandwidth), "rgb8", "bgr8"
-      nitros_format: "nv12"
-      # QoS for sensor_msgs/Image  (<prefix>/image_raw)
-      raw_qos:
-        reliability: "reliable"    # reliable | best_effort
-        durability: "volatile"     # volatile | transient_local
-      # QoS for sensor_msgs/CameraInfo  (<prefix>/camera_info)
-      info_qos:
-        reliability: "reliable"
-        durability: "volatile"
-      # QoS for NitrosImage  (<prefix>/nitros_image_<format>)  — HAVE_NVBUF builds only
-      nitros_qos:
-        reliability: "best_effort" # NITROS zero-copy works well with best_effort
-        durability: "volatile"
-      # publihsed image resolution. -1 if same as input (default)
-      output_resolution:
-        width: -1
-        height: -1
-      # Camera frame id
+    right_camera:
       frame_id: "right_camera"
 
-      # Extrinsics of the camera relative to the specified TF frame (e.g. "base_link"). 
+      # ---- RIGHT CAMERA TOPICS ----
+      topics:
+        topic_name_prefix: "/arducam/right"
+
+        visual_stream:
+          enable: true
+          transport: "compressed"        # raw | compressed
+          encoding: "bgr8"               # bgr8 | rgb8
+          jpeg_quality: 80               # 0-100        (only used when transport=compressed)
+          qos:
+            reliability: "reliable"      # reliable | best_effort
+            durability: "volatile"       # volatile | transient_local
+          fps: 30                        # Target frame rate for publishing the visual stream. Actual frame rate may be lower if the camera cannot keep up.
+          resolution:                    # Resolution for the visual stream. If width or height is set to -1, it will use the full capture resolution for that dimension.
+            width: -1
+            height: -1
+
+        nitros_image:
+          enable: true
+          qos:
+            reliability: "best_effort"   # NITROS zero-copy works well with best_effort
+            durability: "volatile"       # volatile | transient_local
+          format: "nv12"                 # Supported: "nv12" (native VIC output, lowest bandwidth), "nv24", "rgb8", "bgr8"
+          fps: 30                        # Target frame rate for publishing the NITROS image stream. Actual frame rate may be lower if the camera cannot keep up.
+          resolution:                    # Resolution for the NITROS image stream. If width or height is set to -1, it will use the full capture resolution for that dimension.
+            width: -1
+            height: -1
+
+        camera_info:
+          qos:
+            reliability: "reliable"
+            durability: "volatile"
+          fps: 30
+
+
+      # ---- RIGHT CAMERA CALIBRATION ----
+
+      # Extrinsics of the camera relative to the specified TF frame (e.g. "base_link").
       # These are PLACEHOLDER values; replace with your actual measurements or stereo calibration results.
       extrinsics:
-        relative_to: "base_link" # TF frame that the extrinsics are relative to (e.g. "base_link" or "left_camera")
-        rotation: [0.0, 0.0, 0.0] # Roll, pitch, yaw in degrees
-        translation: [0.0, 0.0, 0.0] # X, Y, Z in metres
-      # Intrinsic parameters and calibration for the right camera. 
+        relative_to: "base_link"        # TF frame that the extrinsics are relative to
+        rotation: [0.0, 0.0, 0.0]       # Roll, pitch, yaw in degrees
+        translation: [0.0, 0.0, 0.0]    # X, Y, Z in metres
+
+      # Intrinsic parameters and calibration for the right camera.
       # These are PLACEHOLDER values; replace with your actual calibration results.
       intrinsics:
         fx: 899.8
         fy: 899.6
         cx: 641.4
         cy: 360.1
-        distortion_model: "plumb_bob" # options: "plumb_bob", "rational_polynomial", "thin_prism_fisheye"
-                                            # plumb_bob: use this if the camera has significant radial distortion (e.g. wide-angle lens)
-                                            # rational_polynomial: use this if the camera has significant tangential distortion (e.g. misaligned lens elements)
-                                            # thin_prism_fisheye: use this if the camera has significant thin prism distortion (e.g. fisheye lens)
+        distortion_model: "plumb_bob"   # plumb_bob | rational_polynomial | thin_prism_fisheye
+                                        # plumb_bob: use this if the camera has significant radial distortion (e.g. wide-angle lens)
+                                        # rational_polynomial: use this if the camera has significant tangential distortion (e.g. misaligned lens elements)
+                                        # thin_prism_fisheye: use this if the camera has significant thin prism distortion (e.g. fisheye lens)
         distortion_coefficients: [-0.3185, 0.1098, 0.0005, -0.0004, 0.0000]
-        # Rectification matrix (R) — rotation that aligns the right camera to the
-        # common rectified frame.  Identity here; replace with stereo calibration output.
-        reflection_matrix: 
+        # Rectification matrix (R) — rotation that aligns the right camera to the common rectified frame.
+        # Identity here; replace with stereo calibration output.
+        reflection_matrix:
           rows: 3
           cols: 3
           data: [1.0, 0.0, 0.0,
-                 0.0, 1.0, 0.0,
-                 0.0, 0.0, 1.0] 
+                  0.0, 1.0, 0.0,
+                  0.0, 0.0, 1.0]
         # Projection matrix (P): [fx'  0  cx'  Tx; 0  fy'  cy'  Ty; 0  0  1  0]
         # For the right camera of a stereo pair, Tx = -fx' * baseline (in metres).
         # Example: 120 mm baseline → Tx = -900.5 * 0.120 = -108.06
@@ -155,7 +172,5 @@ arducam_dual_cam_node:
           rows: 3
           cols: 4
           data: [900.5,   0.0, 638.2,    0.0,
-                   0.0, 900.3, 358.7,    0.0,
-                   0.0,   0.0,   1.0,    0.0]
-
-
+                    0.0, 900.3, 358.7,    0.0,
+                    0.0,   0.0,   1.0,    0.0]

@@ -22,6 +22,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <tf2_ros/static_transform_broadcaster.hpp>
 #include <tf2/LinearMath/Quaternion.h>
@@ -57,35 +58,50 @@ private:
   int fps_;
   std::string pixel_format_;
 
-  // ── Per-camera configuration (cam_left.* / cam_right.* params) ───────────
-  std::string topic_left_;        // topic prefix, e.g. /arducam/left  (stored as full image_raw)
-  std::string topic_right_;
-  std::string topic_left_info_;   // = prefix + "/camera_info"
+  // ── Per-camera configuration (left_camera.* / right_camera.* params) ───────
+  std::string topic_vis_left_;       // resolved visual_stream topic (<prefix>/image_raw or /image/compressed)
+  std::string topic_vis_right_;
+  std::string topic_left_info_;      // full camera_info topic name
   std::string topic_right_info_;
   std::string frame_id_left_;
   std::string frame_id_right_;
-  int         out_w_left_{-1};    // published image width;  -1 = eye_width()
-  int         out_h_left_{-1};    // published image height; -1 = combined_height_
-  int         out_w_right_{-1};
-  int         out_h_right_{-1};
+  // visual_stream output resolution (-1 = eye_width() / combined_height_)
+  int         out_w_vis_left_{-1};
+  int         out_h_vis_left_{-1};
+  int         out_w_vis_right_{-1};
+  int         out_h_vis_right_{-1};
+  // nitros_image output resolution (-1 = eye_width() / combined_height_)
+  int         out_w_nitros_left_{-1};
+  int         out_h_nitros_left_{-1};
+  int         out_w_nitros_right_{-1};
+  int         out_h_nitros_right_{-1};
 
   // Pre-built CameraInfo (constructed once in the constructor from inline intrinsic params)
   sensor_msgs::msg::CameraInfo cam_info_left_;
   sensor_msgs::msg::CameraInfo cam_info_right_;
 
-  // Per-camera, per-topic QoS (raw / info / nitros each settable independently)
-  std::string qos_raw_rel_left_{"reliable"},    qos_raw_dur_left_{"volatile"};
-  std::string qos_raw_rel_right_{"reliable"},   qos_raw_dur_right_{"volatile"};
-  std::string qos_info_rel_left_{"reliable"},   qos_info_dur_left_{"volatile"};
-  std::string qos_info_rel_right_{"reliable"},  qos_info_dur_right_{"volatile"};
+  // Per-camera, per-topic QoS (vis / info / nitros each settable independently)
+  std::string qos_vis_rel_left_{"best_effort"},  qos_vis_dur_left_{"volatile"};
+  std::string qos_vis_rel_right_{"best_effort"}, qos_vis_dur_right_{"volatile"};
+  std::string qos_info_rel_left_{"reliable"},    qos_info_dur_left_{"volatile"};
+  std::string qos_info_rel_right_{"reliable"},   qos_info_dur_right_{"volatile"};
   std::string qos_nitros_rel_left_{"best_effort"},  qos_nitros_dur_left_{"volatile"};
   std::string qos_nitros_rel_right_{"best_effort"}, qos_nitros_dur_right_{"volatile"};
 
-  // Per-camera publish control (from cam_{left,right} params)
-  bool        pub_raw_left_{true};           // cam_left.publish_image_raw
-  bool        pub_raw_right_{true};          // cam_right.publish_image_raw
-  std::string nitros_fmt_left_{"nv12"};     // cam_left.nitros_format
-  std::string nitros_fmt_right_{"nv12"};    // cam_right.nitros_format
+  // Per-camera publish control (from left_camera/right_camera params)
+  bool        vis_enable_left_{true};          // left_camera.topics.visual_stream.enable
+  bool        vis_enable_right_{true};         // right_camera.topics.visual_stream.enable
+  bool        pub_nitros_left_{true};          // left_camera.topics.nitros_image.enable
+  bool        pub_nitros_right_{true};         // right_camera.topics.nitros_image.enable
+  std::string nitros_fmt_left_{"nv12"};       // left_camera.topics.nitros_image.format
+  std::string nitros_fmt_right_{"nv12"};      // right_camera.topics.nitros_image.format
+  // visual_stream transport and encoding
+  std::string vis_transport_left_{"compressed"};  // "raw" | "compressed"
+  std::string vis_transport_right_{"compressed"};
+  std::string vis_encoding_left_{"bgr8"};          // "bgr8" | "rgb8"
+  std::string vis_encoding_right_{"bgr8"};
+  int         vis_jpeg_quality_left_{80};
+  int         vis_jpeg_quality_right_{80};
 
   // Static TF broadcaster (publishes extrinsics: relative_to → camera frame_id)
   std::shared_ptr<tf2_ros::StaticTransformBroadcaster> tf_static_broadcaster_;
@@ -111,6 +127,25 @@ private:
 
   int eye_width() const { return combined_width_ / 2; }
 
+  // Effective published dimensions for visual_stream
+  int eff_out_w(bool left) const {
+    int v = left ? out_w_vis_left_ : out_w_vis_right_;
+    return (v > 0) ? v : eye_width();
+  }
+  int eff_out_h(bool left) const {
+    int v = left ? out_h_vis_left_ : out_h_vis_right_;
+    return (v > 0) ? v : combined_height_;
+  }
+  // Effective published dimensions for nitros_image
+  int eff_out_w_nitros(bool left) const {
+    int v = left ? out_w_nitros_left_ : out_w_nitros_right_;
+    return (v > 0) ? v : eye_width();
+  }
+  int eff_out_h_nitros(bool left) const {
+    int v = left ? out_h_nitros_left_ : out_h_nitros_right_;
+    return (v > 0) ? v : combined_height_;
+  }
+
   // try_build_pipeline: attempts to set the pipeline to PLAYING.
   // nvmm  – request memory:NVMM caps from v4l2src and nvvidconv
   // out_fmt – "NV12" or "BGRx"; the nvvidconv output format
@@ -120,23 +155,24 @@ private:
   void process_sample(GstSample * sample);
 
   // ── Publishers ────────────────────────────────────────────────────────────
-  // Raw image publishers (sensor_msgs/Image, bgr8).
-  // Created only when cam_{left,right}.publish_image_raw is true (default: true).
-  // nullptr when disabled — callers must check pub_raw_left_/right_ flag before use.
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr      pub_left_raw_;
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr      pub_right_raw_;
-  rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr pub_left_info_;
-  rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr pub_right_info_;
+  // visual_stream publishers — one of raw or compressed per side, set by transport param.
+  // nullptr when disabled (vis_enable_left_/right_=false).
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr           pub_vis_raw_left_;
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr           pub_vis_raw_right_;
+  rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_vis_comp_left_;
+  rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_vis_comp_right_;
+  rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr      pub_left_info_;
+  rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr      pub_right_info_;
 
-  // NITROS publishers: GPU-resident zero-copy topic <prefix>/nitros_image_<format>.
-  // Format is cam_{left,right}.nitros_format param (default: "nv12").
-  // Created only when HAVE_NVBUF is compiled in.
+  // NITROS publishers: GPU-resident zero-copy topic.
+  // Full topic names always declared so the constructor log can reference them.
+  // Populated from {left,right}_camera.topics.nitros_image.topic_name param.
+  std::string topic_left_nitros_;
+  std::string topic_right_nitros_;
+  // Publishers created only when HAVE_NVBUF is compiled in.
 #ifdef HAVE_NVBUF
   rclcpp::Publisher<nvidia::isaac_ros::nitros::NitrosImage>::SharedPtr pub_left_nitros_;
   rclcpp::Publisher<nvidia::isaac_ros::nitros::NitrosImage>::SharedPtr pub_right_nitros_;
-  // Full NITROS topic names (= prefix + "/nitros_image_" + format)
-  std::string topic_left_nitros_;
-  std::string topic_right_nitros_;
 #endif
 
   // ── Private helpers ───────────────────────────────────────────────────────
@@ -145,15 +181,6 @@ private:
   /// Broadcast a static TF transform (extrinsics) for one camera side.
   void broadcast_static_tf(const std::string & side, const std::string & child_frame);
 
-  /// Effective published width/height for one eye (respects output_resolution param).
-  int eff_out_w(bool left) const {
-    int v = left ? out_w_left_ : out_w_right_;
-    return (v > 0) ? v : eye_width();
-  }
-  int eff_out_h(bool left) const {
-    int v = left ? out_h_left_ : out_h_right_;
-    return (v > 0) ? v : combined_height_;
-  }
 
   // ── NvBufSurface / VIC hardware path ─────────────────────────────────────
   // Available when HAVE_NVBUF is defined and use_nvmm_ is true.

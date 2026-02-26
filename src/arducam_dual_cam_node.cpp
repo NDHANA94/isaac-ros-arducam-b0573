@@ -48,12 +48,14 @@
  *   3. v4l2src(UYVY)      → nvvidconv/VIC → BGRx         → appsink  [CPU path]
  *
  * Topics published (matches isaac_ros_argus_camera stereo pattern):
- *   /arducam/left/image_raw              sensor_msgs/Image   bgr8, always (rviz2)
- *   /arducam/right/image_raw             sensor_msgs/Image   bgr8, always (rviz2)
+ *   /arducam/left/image/compressed       sensor_msgs/CompressedImage  BGR jpeg (default, rviz2 net)
+ *   /arducam/right/image/compressed      sensor_msgs/CompressedImage  BGR jpeg (default, rviz2 net)
+ *   /arducam/left/image_raw              sensor_msgs/Image   bgr8, when transport=raw
+ *   /arducam/right/image_raw             sensor_msgs/Image   bgr8, when transport=raw
  *   /arducam/left/camera_info            sensor_msgs/CameraInfo, always
  *   /arducam/right/camera_info           sensor_msgs/CameraInfo, always
- *   /arducam/left/nitros_image_nv12      NitrosImage  NV12 GPU-resident, HAVE_NVBUF only
- *   /arducam/right/nitros_image_nv12     NitrosImage  NV12 GPU-resident, HAVE_NVBUF only
+ *   /arducam/left/nitros_image_<fmt>     NitrosImage  GPU-resident (format-configurable), HAVE_NVBUF only
+ *   /arducam/right/nitros_image_<fmt>    NitrosImage  GPU-resident (format-configurable), HAVE_NVBUF only
  *
  * Parameters:
  *   device              (string)  /dev/video0
@@ -62,17 +64,25 @@
  *   fps                 (int)     30
  *   pixel_format        (string)  UYVY
  *
- *   cam_left / cam_right  (nested, mirrors params.yaml structure)
- *     .topic_name                     string   /arducam/{left,right}/image_raw
- *     .topic_qos.reliability          string   reliable | best_effort
- *     .topic_qos.durability           string   volatile | transient_local
- *     .output_resolution.{width,height} int    -1 = same as capture resolution
- *     .frame_id                       string   left_camera / right_camera
- *     .extrinsics.relative_to         string   base_link
- *     .extrinsics.rotation            double[] [roll, pitch, yaw] deg
- *     .extrinsics.translation         double[] [x, y, z] m
- *     .intrinsics.fx / fy / cx / cy   double
- *     .intrinsics.distortion_model    string   plumb_bob
+ *   left_camera / right_camera  (nested, mirrors params.yaml structure)
+ *     .frame_id                               string   left_camera / right_camera
+ *     .topics.topic_name_prefix               string   /arducam/{left,right}
+ *     .topics.visual_stream.enable            bool     true
+ *     .topics.visual_stream.transport         string   compressed | raw
+ *     .topics.visual_stream.encoding          string   bgr8 | rgb8
+ *     .topics.visual_stream.jpeg_quality      int      80 (only when transport=compressed)
+ *     .topics.visual_stream.qos.{reliability,durability}  string
+ *     .topics.visual_stream.resolution.{width,height} int  -1 = same as capture
+ *     .topics.nitros_image.enable             bool     true
+ *     .topics.nitros_image.qos.{reliability,durability}  string
+ *     .topics.nitros_image.format             string   nv12 | nv24 | rgb8 | bgr8
+ *     .topics.nitros_image.resolution.{width,height} int  -1 = same as capture
+ *     .topics.camera_info.qos.{reliability,durability}  string
+ *     .extrinsics.relative_to          string   base_link
+ *     .extrinsics.rotation             double[] [roll, pitch, yaw] deg
+ *     .extrinsics.translation          double[] [x, y, z] m
+ *     .intrinsics.fx / fy / cx / cy    double
+ *     .intrinsics.distortion_model     string   plumb_bob
  *     .intrinsics.distortion_coefficients double[]
  *     .intrinsics.reflection_matrix.data  double[9]   rectification R
  *     .intrinsics.projection_matrix.data  double[12]  projection P
@@ -115,26 +125,44 @@ ArducamDualCamNode::ArducamDualCamNode(const rclcpp::NodeOptions & options)
   declare_parameter("fps",           30);
   declare_parameter("pixel_format",  "UYVY");
 
-  // ── Per-camera parameters (cam_left / cam_right) ───────────────────────────
-  for (const std::string side : {"cam_left", "cam_right"}) {
-    const bool is_left = (side == "cam_left");
-    declare_parameter(side + ".topic_name_prefix",
-      is_left ? "/arducam/left" : "/arducam/right");
-    declare_parameter(side + ".publish_image_raw",  true);
-    declare_parameter(side + ".nitros_format",       std::string("nv12"));
-    declare_parameter(side + ".raw_qos.reliability",             std::string("reliable"));
-    declare_parameter(side + ".raw_qos.durability",              std::string("volatile"));
-    declare_parameter(side + ".info_qos.reliability",            std::string("reliable"));
-    declare_parameter(side + ".info_qos.durability",             std::string("volatile"));
-    declare_parameter(side + ".nitros_qos.reliability",          std::string("best_effort"));
-    declare_parameter(side + ".nitros_qos.durability",           std::string("volatile"));
-    declare_parameter(side + ".output_resolution.width",            -1);
-    declare_parameter(side + ".output_resolution.height",           -1);
+  // ── Per-camera parameters (left_camera / right_camera) ─────────────────────
+  for (const std::string side : {"left_camera", "right_camera"}) {
+    const bool is_left = (side == "left_camera");
     declare_parameter(side + ".frame_id",
       is_left ? "left_camera" : "right_camera");
+
+    // ── topics.visual_stream ────────────────────────────────────────────────
+    declare_parameter(side + ".topics.topic_name_prefix",
+      is_left ? "/arducam/left" : "/arducam/right");
+    declare_parameter(side + ".topics.visual_stream.enable",       true);
+    declare_parameter(side + ".topics.visual_stream.transport",    std::string("compressed"));
+    declare_parameter(side + ".topics.visual_stream.encoding",     std::string("bgr8"));
+    declare_parameter(side + ".topics.visual_stream.jpeg_quality", 80);
+    declare_parameter(side + ".topics.visual_stream.qos.reliability", std::string("best_effort"));
+    declare_parameter(side + ".topics.visual_stream.qos.durability",  std::string("volatile"));
+    declare_parameter(side + ".topics.visual_stream.resolution.width",  -1);
+    declare_parameter(side + ".topics.visual_stream.resolution.height", -1);
+
+    // ── topics.nitros_image ─────────────────────────────────────────────────
+    declare_parameter(side + ".topics.nitros_image.enable",    true);
+    declare_parameter(side + ".topics.nitros_image.qos.reliability", std::string("best_effort"));
+    declare_parameter(side + ".topics.nitros_image.qos.durability",  std::string("volatile"));
+    declare_parameter(side + ".topics.nitros_image.format",    std::string("nv12"));
+    declare_parameter(side + ".topics.nitros_image.fps",       30);
+    declare_parameter(side + ".topics.nitros_image.resolution.width",  -1);
+    declare_parameter(side + ".topics.nitros_image.resolution.height", -1);
+
+    // ── topics.camera_info ──────────────────────────────────────────────────
+    declare_parameter(side + ".topics.camera_info.qos.reliability", std::string("reliable"));
+    declare_parameter(side + ".topics.camera_info.qos.durability",  std::string("volatile"));
+    declare_parameter(side + ".topics.camera_info.fps",        30);
+
+    // ── extrinsics ───────────────────────────────────────────────────────────
     declare_parameter(side + ".extrinsics.relative_to",             "base_link");
     declare_parameter(side + ".extrinsics.rotation",    std::vector<double>{0.0, 0.0, 0.0});
     declare_parameter(side + ".extrinsics.translation", std::vector<double>{0.0, 0.0, 0.0});
+
+    // ── intrinsics ───────────────────────────────────────────────────────────
     declare_parameter(side + ".intrinsics.fx",                      900.0);
     declare_parameter(side + ".intrinsics.fy",                      900.0);
     declare_parameter(side + ".intrinsics.cx",                      640.0);
@@ -154,62 +182,93 @@ ArducamDualCamNode::ArducamDualCamNode(const rclcpp::NodeOptions & options)
   fps_             = get_parameter("fps").as_int();
   pixel_format_    = get_parameter("pixel_format").as_string();
 
-  // Build full topic names from the prefix: <prefix>/image_raw, <prefix>/camera_info
-  auto build_topic = [](const std::string & prefix, const std::string & suffix) {
-    return prefix + "/" + suffix;
-  };
+  // ── Read per-camera visual_stream config ──────────────────────────────────
+  frame_id_left_  = get_parameter("left_camera.frame_id").as_string();
+  frame_id_right_ = get_parameter("right_camera.frame_id").as_string();
 
-  const std::string prefix_left  = get_parameter("cam_left.topic_name_prefix").as_string();
-  const std::string prefix_right = get_parameter("cam_right.topic_name_prefix").as_string();
-  topic_left_       = build_topic(prefix_left,  "image_raw");
-  topic_right_      = build_topic(prefix_right, "image_raw");
-  topic_left_info_  = build_topic(prefix_left,  "camera_info");
-  topic_right_info_ = build_topic(prefix_right, "camera_info");
-  frame_id_left_    = get_parameter("cam_left.frame_id").as_string();
-  frame_id_right_   = get_parameter("cam_right.frame_id").as_string();
-  out_w_left_       = get_parameter("cam_left.output_resolution.width").as_int();
-  out_h_left_       = get_parameter("cam_left.output_resolution.height").as_int();
-  out_w_right_      = get_parameter("cam_right.output_resolution.width").as_int();
-  out_h_right_      = get_parameter("cam_right.output_resolution.height").as_int();
-  qos_raw_rel_left_     = get_parameter("cam_left.raw_qos.reliability").as_string();
-  qos_raw_dur_left_     = get_parameter("cam_left.raw_qos.durability").as_string();
-  qos_raw_rel_right_    = get_parameter("cam_right.raw_qos.reliability").as_string();
-  qos_raw_dur_right_    = get_parameter("cam_right.raw_qos.durability").as_string();
-  qos_info_rel_left_    = get_parameter("cam_left.info_qos.reliability").as_string();
-  qos_info_dur_left_    = get_parameter("cam_left.info_qos.durability").as_string();
-  qos_info_rel_right_   = get_parameter("cam_right.info_qos.reliability").as_string();
-  qos_info_dur_right_   = get_parameter("cam_right.info_qos.durability").as_string();
-  qos_nitros_rel_left_  = get_parameter("cam_left.nitros_qos.reliability").as_string();
-  qos_nitros_dur_left_  = get_parameter("cam_left.nitros_qos.durability").as_string();
-  qos_nitros_rel_right_ = get_parameter("cam_right.nitros_qos.reliability").as_string();
-  qos_nitros_dur_right_ = get_parameter("cam_right.nitros_qos.durability").as_string();
-  pub_raw_left_     = get_parameter("cam_left.publish_image_raw").as_bool();
-  pub_raw_right_    = get_parameter("cam_right.publish_image_raw").as_bool();
-  nitros_fmt_left_  = get_parameter("cam_left.nitros_format").as_string();
-  nitros_fmt_right_ = get_parameter("cam_right.nitros_format").as_string();
+  vis_enable_left_       = get_parameter("left_camera.topics.visual_stream.enable").as_bool();
+  vis_enable_right_      = get_parameter("right_camera.topics.visual_stream.enable").as_bool();
+  vis_transport_left_    = get_parameter("left_camera.topics.visual_stream.transport").as_string();
+  vis_transport_right_   = get_parameter("right_camera.topics.visual_stream.transport").as_string();
+  vis_encoding_left_     = get_parameter("left_camera.topics.visual_stream.encoding").as_string();
+  vis_encoding_right_    = get_parameter("right_camera.topics.visual_stream.encoding").as_string();
+  vis_jpeg_quality_left_  = get_parameter("left_camera.topics.visual_stream.jpeg_quality").as_int();
+  vis_jpeg_quality_right_ = get_parameter("right_camera.topics.visual_stream.jpeg_quality").as_int();
+
+  // Derive topic names from prefix + transport
+  {
+    const std::string pfx_l = get_parameter("left_camera.topics.topic_name_prefix").as_string();
+    const std::string pfx_r = get_parameter("right_camera.topics.topic_name_prefix").as_string();
+    topic_vis_left_   = (vis_transport_left_  == "compressed") ? pfx_l + "/image/compressed"
+                                                                : pfx_l + "/image_raw";
+    topic_vis_right_  = (vis_transport_right_ == "compressed") ? pfx_r + "/image/compressed"
+                                                               : pfx_r + "/image_raw";
+    topic_left_info_  = (vis_transport_left_  == "compressed") ? pfx_l + "/image/camera_info"
+                                                                : pfx_l + "/camera_info";    
+    topic_right_info_ = (vis_transport_right_ == "compressed") ? pfx_r + "/image/camera_info"
+                                                                : pfx_r + "/camera_info"; 
+  }
+
+  // visual_stream output resolution
+  out_w_vis_left_   = get_parameter("left_camera.topics.visual_stream.resolution.width").as_int();
+  out_h_vis_left_   = get_parameter("left_camera.topics.visual_stream.resolution.height").as_int();
+  out_w_vis_right_  = get_parameter("right_camera.topics.visual_stream.resolution.width").as_int();
+  out_h_vis_right_  = get_parameter("right_camera.topics.visual_stream.resolution.height").as_int();
+
+  // nitros_image output resolution
+  out_w_nitros_left_  = get_parameter("left_camera.topics.nitros_image.resolution.width").as_int();
+  out_h_nitros_left_  = get_parameter("left_camera.topics.nitros_image.resolution.height").as_int();
+  out_w_nitros_right_ = get_parameter("right_camera.topics.nitros_image.resolution.width").as_int();
+  out_h_nitros_right_ = get_parameter("right_camera.topics.nitros_image.resolution.height").as_int();
+
+  qos_vis_rel_left_     = get_parameter("left_camera.topics.visual_stream.qos.reliability").as_string();
+  qos_vis_dur_left_     = get_parameter("left_camera.topics.visual_stream.qos.durability").as_string();
+  qos_vis_rel_right_    = get_parameter("right_camera.topics.visual_stream.qos.reliability").as_string();
+  qos_vis_dur_right_    = get_parameter("right_camera.topics.visual_stream.qos.durability").as_string();
+  qos_info_rel_left_    = get_parameter("left_camera.topics.camera_info.qos.reliability").as_string();
+  qos_info_dur_left_    = get_parameter("left_camera.topics.camera_info.qos.durability").as_string();
+  qos_info_rel_right_   = get_parameter("right_camera.topics.camera_info.qos.reliability").as_string();
+  qos_info_dur_right_   = get_parameter("right_camera.topics.camera_info.qos.durability").as_string();
+  qos_nitros_rel_left_  = get_parameter("left_camera.topics.nitros_image.qos.reliability").as_string();
+  qos_nitros_dur_left_  = get_parameter("left_camera.topics.nitros_image.qos.durability").as_string();
+  qos_nitros_rel_right_ = get_parameter("right_camera.topics.nitros_image.qos.reliability").as_string();
+  qos_nitros_dur_right_ = get_parameter("right_camera.topics.nitros_image.qos.durability").as_string();
+
+  pub_nitros_left_      = get_parameter("left_camera.topics.nitros_image.enable").as_bool();
+  pub_nitros_right_     = get_parameter("right_camera.topics.nitros_image.enable").as_bool();
+  nitros_fmt_left_      = get_parameter("left_camera.topics.nitros_image.format").as_string();
+  nitros_fmt_right_     = get_parameter("right_camera.topics.nitros_image.format").as_string();
 
   RCLCPP_INFO(get_logger(),
     "Arducam B0573 | device=%s  combined=%dx%d  eye=%dx%d  fps=%d  fmt=%s",
     device_.c_str(), combined_width_, combined_height_,
     eye_width(), combined_height_, fps_, pixel_format_.c_str());
   RCLCPP_INFO(get_logger(),
-    "Left  | prefix=%s  frame=%s  out=%dx%d  raw=%s  nitros_fmt=%s",
-    prefix_left.c_str(), frame_id_left_.c_str(),
-    eff_out_w(true), eff_out_h(true),
-    pub_raw_left_  ? "yes" : "no", nitros_fmt_left_.c_str());
+    "Left  | vis=%s[%s/%s]  nitros=%s(%s)  frame=%s  out_vis=%dx%d  out_nitros=%dx%d",
+    vis_enable_left_  ? topic_vis_left_.c_str()    : "(disabled)",
+    vis_transport_left_.c_str(), vis_encoding_left_.c_str(),
+    pub_nitros_left_  ? topic_left_nitros_.c_str() : "(disabled)",
+    nitros_fmt_left_.c_str(),
+    frame_id_left_.c_str(),
+    eff_out_w(true),        eff_out_h(true),
+    eff_out_w_nitros(true), eff_out_h_nitros(true));
   RCLCPP_INFO(get_logger(),
-    "        raw_qos=[%s/%s]  info_qos=[%s/%s]  nitros_qos=[%s/%s]",
-    qos_raw_rel_left_.c_str(),    qos_raw_dur_left_.c_str(),
+    "        vis_qos=[%s/%s]  info_qos=[%s/%s]  nitros_qos=[%s/%s]",
+    qos_vis_rel_left_.c_str(),    qos_vis_dur_left_.c_str(),
     qos_info_rel_left_.c_str(),   qos_info_dur_left_.c_str(),
     qos_nitros_rel_left_.c_str(), qos_nitros_dur_left_.c_str());
   RCLCPP_INFO(get_logger(),
-    "Right | prefix=%s  frame=%s  out=%dx%d  raw=%s  nitros_fmt=%s",
-    prefix_right.c_str(), frame_id_right_.c_str(),
-    eff_out_w(false), eff_out_h(false),
-    pub_raw_right_ ? "yes" : "no", nitros_fmt_right_.c_str());
+    "Right | vis=%s[%s/%s]  nitros=%s(%s)  frame=%s  out_vis=%dx%d  out_nitros=%dx%d",
+    vis_enable_right_ ? topic_vis_right_.c_str()    : "(disabled)",
+    vis_transport_right_.c_str(), vis_encoding_right_.c_str(),
+    pub_nitros_right_ ? topic_right_nitros_.c_str() : "(disabled)",
+    nitros_fmt_right_.c_str(),
+    frame_id_right_.c_str(),
+    eff_out_w(false),        eff_out_h(false),
+    eff_out_w_nitros(false), eff_out_h_nitros(false));
   RCLCPP_INFO(get_logger(),
-    "        raw_qos=[%s/%s]  info_qos=[%s/%s]  nitros_qos=[%s/%s]",
-    qos_raw_rel_right_.c_str(),    qos_raw_dur_right_.c_str(),
+    "        vis_qos=[%s/%s]  info_qos=[%s/%s]  nitros_qos=[%s/%s]",
+    qos_vis_rel_right_.c_str(),    qos_vis_dur_right_.c_str(),
     qos_info_rel_right_.c_str(),   qos_info_dur_right_.c_str(),
     qos_nitros_rel_right_.c_str(), qos_nitros_dur_right_.c_str());
 
@@ -221,52 +280,77 @@ ArducamDualCamNode::ArducamDualCamNode(const rclcpp::NodeOptions & options)
     return q;
   };
 
-  // ── Raw sensor_msgs/Image publishers — created only when publish_image_raw=true ──
-  // topic = <prefix>/image_raw.  nullptr when disabled.
-  if (pub_raw_left_) {
-    pub_left_raw_  = create_publisher<sensor_msgs::msg::Image>(
-      topic_left_,  make_qos(qos_raw_rel_left_,  qos_raw_dur_left_));
-    RCLCPP_INFO(get_logger(), "image_raw LEFT  → %s", topic_left_.c_str());
+  // ── visual_stream publishers — created only when enable=true ──────────────
+  if (vis_enable_left_) {
+    if (vis_transport_left_ == "compressed") {
+      pub_vis_comp_left_ = create_publisher<sensor_msgs::msg::CompressedImage>(
+        topic_vis_left_, make_qos(qos_vis_rel_left_, qos_vis_dur_left_));
+      RCLCPP_INFO(get_logger(), "visual_stream LEFT  -> %s  [compressed/%s  q=%d]",
+        topic_vis_left_.c_str(), vis_encoding_left_.c_str(), vis_jpeg_quality_left_);
+    } else {
+      pub_vis_raw_left_ = create_publisher<sensor_msgs::msg::Image>(
+        topic_vis_left_, make_qos(qos_vis_rel_left_, qos_vis_dur_left_));
+      RCLCPP_INFO(get_logger(), "visual_stream LEFT  -> %s  [raw/%s]",
+        topic_vis_left_.c_str(), vis_encoding_left_.c_str());
+    }
   } else {
-    RCLCPP_INFO(get_logger(), "image_raw LEFT   disabled (publish_image_raw=false)");
+    RCLCPP_INFO(get_logger(), "visual_stream LEFT   disabled (topics.visual_stream.enable=false)");
   }
-  if (pub_raw_right_) {
-    pub_right_raw_ = create_publisher<sensor_msgs::msg::Image>(
-      topic_right_, make_qos(qos_raw_rel_right_, qos_raw_dur_right_));
-    RCLCPP_INFO(get_logger(), "image_raw RIGHT → %s", topic_right_.c_str());
+  if (vis_enable_right_) {
+    if (vis_transport_right_ == "compressed") {
+      pub_vis_comp_right_ = create_publisher<sensor_msgs::msg::CompressedImage>(
+        topic_vis_right_, make_qos(qos_vis_rel_right_, qos_vis_dur_right_));
+      RCLCPP_INFO(get_logger(), "visual_stream RIGHT -> %s  [compressed/%s  q=%d]",
+        topic_vis_right_.c_str(), vis_encoding_right_.c_str(), vis_jpeg_quality_right_);
+    } else {
+      pub_vis_raw_right_ = create_publisher<sensor_msgs::msg::Image>(
+        topic_vis_right_, make_qos(qos_vis_rel_right_, qos_vis_dur_right_));
+      RCLCPP_INFO(get_logger(), "visual_stream RIGHT -> %s  [raw/%s]",
+        topic_vis_right_.c_str(), vis_encoding_right_.c_str());
+    }
   } else {
-    RCLCPP_INFO(get_logger(), "image_raw RIGHT  disabled (publish_image_raw=false)");
+    RCLCPP_INFO(get_logger(), "visual_stream RIGHT  disabled (topics.visual_stream.enable=false)");
   }
-  // camera_info is always published regardless of publish_image_raw
+  // camera_info is always published
   pub_left_info_  = create_publisher<sensor_msgs::msg::CameraInfo>(
     topic_left_info_,  make_qos(qos_info_rel_left_,  qos_info_dur_left_));
   pub_right_info_ = create_publisher<sensor_msgs::msg::CameraInfo>(
     topic_right_info_, make_qos(qos_info_rel_right_, qos_info_dur_right_));
 
   // ── NITROS publishers (GPU-resident zero-copy, HAVE_NVBUF only) ────────────────
-  // Topic: <prefix>/nitros_image_<format>  (cam_{left,right}.nitros_format)
-  // Supported NitrosImageBuilder encodings: "nv12", "rgb8", "bgr8"
+  // Topic suffix derived from nitros_image.format so the topic name always reflects
+  // the declared encoding.  Supported NitrosImageBuilder encodings: "nv12", "nv24", "rgb8", "bgr8"
 #ifdef HAVE_NVBUF
-  topic_left_nitros_  = build_topic(prefix_left,  "nitros_image_" + nitros_fmt_left_);
-  topic_right_nitros_ = build_topic(prefix_right, "nitros_image_" + nitros_fmt_right_);
-  pub_left_nitros_  = create_publisher<NitrosImage>(
-    topic_left_nitros_,  make_qos(qos_nitros_rel_left_,  qos_nitros_dur_left_));
-  pub_right_nitros_ = create_publisher<NitrosImage>(
-    topic_right_nitros_, make_qos(qos_nitros_rel_right_, qos_nitros_dur_right_));
-  RCLCPP_INFO(get_logger(), "NITROS LEFT  → %s  (encoding=%s)",
-    topic_left_nitros_.c_str(),  nitros_fmt_left_.c_str());
-  RCLCPP_INFO(get_logger(), "NITROS RIGHT → %s  (encoding=%s)",
-    topic_right_nitros_.c_str(), nitros_fmt_right_.c_str());
+  topic_left_nitros_  = get_parameter("left_camera.topics.topic_name_prefix").as_string()
+                        + "/nitros_image_" + nitros_fmt_left_;
+  topic_right_nitros_ = get_parameter("right_camera.topics.topic_name_prefix").as_string()
+                        + "/nitros_image_" + nitros_fmt_right_;
+  if (pub_nitros_left_) {
+    pub_left_nitros_  = create_publisher<NitrosImage>(
+      topic_left_nitros_,  make_qos(qos_nitros_rel_left_,  qos_nitros_dur_left_));
+    RCLCPP_INFO(get_logger(), "NITROS LEFT  -> %s  (format=%s)",
+      topic_left_nitros_.c_str(), nitros_fmt_left_.c_str());
+  } else {
+    RCLCPP_INFO(get_logger(), "NITROS LEFT   disabled (topics.nitros_image.enable=false)");
+  }
+  if (pub_nitros_right_) {
+    pub_right_nitros_ = create_publisher<NitrosImage>(
+      topic_right_nitros_, make_qos(qos_nitros_rel_right_, qos_nitros_dur_right_));
+    RCLCPP_INFO(get_logger(), "NITROS RIGHT -> %s  (format=%s)",
+      topic_right_nitros_.c_str(), nitros_fmt_right_.c_str());
+  } else {
+    RCLCPP_INFO(get_logger(), "NITROS RIGHT  disabled (topics.nitros_image.enable=false)");
+  }
 #endif
 
   // ── Build CameraInfo from inline intrinsic parameters ────────────────────
-  cam_info_left_  = build_cam_info("cam_left",  eye_width(), combined_height_);
-  cam_info_right_ = build_cam_info("cam_right", eye_width(), combined_height_);
+  cam_info_left_  = build_cam_info("left_camera",  eye_width(), combined_height_);
+  cam_info_right_ = build_cam_info("right_camera", eye_width(), combined_height_);
 
   // ── Broadcast static TF transforms (extrinsics) ──────────────────────────
   tf_static_broadcaster_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(this);
-  broadcast_static_tf("cam_left",  frame_id_left_);
-  broadcast_static_tf("cam_right", frame_id_right_);
+  broadcast_static_tf("left_camera",  frame_id_left_);
+  broadcast_static_tf("right_camera", frame_id_right_);
 
   // ── GStreamer ────────────────────────────────────────────────────────────
   int   argc = 0;
@@ -315,28 +399,29 @@ ArducamDualCamNode::~ArducamDualCamNode()
 
 // ─────────────────────────────────────────────────────────────────────────────
 // build_cam_info()
-//   Reads the inline intrinsic parameters for the given side ("cam_left" or
-//   "cam_right") and constructs a sensor_msgs::CameraInfo ready for publishing.
+//   Reads the inline intrinsic parameters for the given camera side
+//   ("left_camera" or "right_camera") and constructs a sensor_msgs::CameraInfo.
 //   The header (stamp / frame_id) is intentionally left empty here; it is filled
 //   in at publish time so that each message carries the correct per-frame stamp.
 // ─────────────────────────────────────────────────────────────────────────────
 sensor_msgs::msg::CameraInfo ArducamDualCamNode::build_cam_info(
   const std::string & side, int w, int h)
 {
+  const std::string p = side + ".intrinsics";
   sensor_msgs::msg::CameraInfo ci;
   ci.width  = static_cast<uint32_t>(w);
   ci.height = static_cast<uint32_t>(h);
 
   ci.distortion_model =
-    get_parameter(side + ".intrinsics.distortion_model").as_string();
+    get_parameter(p + ".distortion_model").as_string();
 
-  auto d = get_parameter(side + ".intrinsics.distortion_coefficients").as_double_array();
+  auto d = get_parameter(p + ".distortion_coefficients").as_double_array();
   ci.d.assign(d.begin(), d.end());
 
-  const double fx = get_parameter(side + ".intrinsics.fx").as_double();
-  const double fy = get_parameter(side + ".intrinsics.fy").as_double();
-  const double cx = get_parameter(side + ".intrinsics.cx").as_double();
-  const double cy = get_parameter(side + ".intrinsics.cy").as_double();
+  const double fx = get_parameter(p + ".fx").as_double();
+  const double fy = get_parameter(p + ".fy").as_double();
+  const double cx = get_parameter(p + ".cx").as_double();
+  const double cy = get_parameter(p + ".cy").as_double();
 
   // Camera matrix K (3×3, row-major)
   ci.k = {fx,  0.0, cx,
@@ -344,7 +429,7 @@ sensor_msgs::msg::CameraInfo ArducamDualCamNode::build_cam_info(
           0.0, 0.0, 1.0};
 
   // Rectification matrix R (3×3, row-major)
-  auto r_data = get_parameter(side + ".intrinsics.reflection_matrix.data").as_double_array();
+  auto r_data = get_parameter(p + ".reflection_matrix.data").as_double_array();
   if (r_data.size() == 9) {
     std::copy(r_data.begin(), r_data.end(), ci.r.begin());
   } else {
@@ -352,7 +437,7 @@ sensor_msgs::msg::CameraInfo ArducamDualCamNode::build_cam_info(
   }
 
   // Projection matrix P (3×4, row-major)
-  auto p_data = get_parameter(side + ".intrinsics.projection_matrix.data").as_double_array();
+  auto p_data = get_parameter(p + ".projection_matrix.data").as_double_array();
   if (p_data.size() == 12) {
     std::copy(p_data.begin(), p_data.end(), ci.p.begin());
   } else {
@@ -369,17 +454,18 @@ sensor_msgs::msg::CameraInfo ArducamDualCamNode::build_cam_info(
 
 // ─────────────────────────────────────────────────────────────────────────────
 // broadcast_static_tf()
-//   Reads the extrinsics for the given side and publishes a latched static TF
+//   Reads {left,right}_camera.topics.extrinsics and publishes a latched static TF
 //   transform from the parent frame (extrinsics.relative_to) to child_frame.
 //   rotation is [roll, pitch, yaw] in degrees; translation is [x, y, z] in m.
 // ─────────────────────────────────────────────────────────────────────────────
 void ArducamDualCamNode::broadcast_static_tf(
   const std::string & side, const std::string & child_frame)
 {
+  const std::string ep = side + ".extrinsics";
   const std::string parent =
-    get_parameter(side + ".extrinsics.relative_to").as_string();
-  auto rpy = get_parameter(side + ".extrinsics.rotation").as_double_array();
-  auto xyz = get_parameter(side + ".extrinsics.translation").as_double_array();
+    get_parameter(ep + ".relative_to").as_string();
+  auto rpy = get_parameter(ep + ".rotation").as_double_array();
+  auto xyz = get_parameter(ep + ".translation").as_double_array();
 
   constexpr double DEG2RAD = M_PI / 180.0;
   tf2::Quaternion q;
@@ -753,8 +839,8 @@ void ArducamDualCamNode::init_nvbuf_surfaces()
   use_nvbuf_ = true;
   RCLCPP_INFO(get_logger(),
     "NvBufSurface ready  eye=%dx%d"
-    "  NV12(NITROS): cuda_left=%p cuda_right=%p  buf=%zu B"
-    "  BGRA(image_raw): %s",
+    "  NITROS staging(NV12): cuda_left=%p cuda_right=%p  buf=%zu B"
+    "  BGRA(visual_stream): %s",  // staging is always NV12; NitrosImageBuilder.WithEncoding sets declared fmt
     eye_width(), combined_height_,
     cuda_nv12_left_, cuda_nv12_right_, nv12_size,
     (nvbuf_raw_left_ && nvbuf_raw_right_) ? "VIC hw path" : "CPU cvtColor fallback");
@@ -841,7 +927,7 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
   // ── image_raw VIC path: NV12→BGRA crop in the same hardware pass ───────────
   // Kick off both BGRA transforms before waiting on ANY sync object so all four
   // VIC jobs run concurrently.  sync_raw_* are only used if nvbuf_raw_* allocated.
-  const bool want_raw = pub_raw_left_ || pub_raw_right_;
+  const bool want_raw = vis_enable_left_ || vis_enable_right_;
   const bool have_raw_surfs = nvbuf_raw_left_ && nvbuf_raw_right_;
   NvBufSurfTransformSyncObj_t sync_raw_left  = nullptr;
   NvBufSurfTransformSyncObj_t sync_raw_right = nullptr;
@@ -872,7 +958,7 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
     return false;
   }
 
-  // Wait for all VIC jobs — NV12 (NITROS) and BGRA (image_raw) run concurrently
+  // Wait for all VIC jobs — NV12 staging (NITROS) and BGRA (visual_stream) run concurrently
   NvBufSurfTransformSyncObjWait(sync_left,  -1);
   NvBufSurfTransformSyncObjWait(sync_right, -1);
   NvBufSurfTransformSyncObjDestroy(&sync_left);
@@ -943,29 +1029,37 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
   pub_cam_info(pub_left_info_,  cam_info_left_,  frame_id_left_);
   pub_cam_info(pub_right_info_, cam_info_right_, frame_id_right_);
 
-  // ── Raw sensor_msgs/Image (rviz2) ─────────────────────────────────────────
+  // ── visual_stream publish (rviz2 / network) ──────────────────────────────
   // VIC hw path (preferred): nvbuf_raw_{left,right}_ already contain BGRA data
   // from the async transform above. mappedAddr.addr[0] is directly usable as a
   // cv::Mat — no heap allocation, no memcpy, no cvtColor loop.
   //
   // CPU fallback (if BGRA surfaces weren't allocated): de-stride the NV12
   // SURFACE_ARRAY and run cv::cvtColor — same as the original path.
-  auto publish_raw_side = [&](
-    NvBufSurface * bgra_surf,        // null → CPU fallback
-    NvBufSurface * nv12_surf,        // used for CPU fallback only
-    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr & pub,
-    const std::string & frame_id,
-    int out_w, int out_h)
+  //
+  // transport="compressed": JPEG-encode BGR/RGB on CPU (~1 ms @ 640×480) and
+  // publish sensor_msgs/CompressedImage.  Reduces network bandwidth by ~97%.
+  // transport="raw": publish sensor_msgs/Image (raw BGR/RGB, full bandwidth).
+  auto publish_visual_side = [&](
+    NvBufSurface * bgra_surf,   // null → CPU NV12 fallback
+    NvBufSurface * nv12_surf,   // used for CPU fallback only
+    bool is_left)
   {
-    cv::Mat bgr;
+    const std::string & transport = is_left ? vis_transport_left_    : vis_transport_right_;
+    const std::string & encoding  = is_left ? vis_encoding_left_     : vis_encoding_right_;
+    const int           jpeg_q    = is_left ? vis_jpeg_quality_left_ : vis_jpeg_quality_right_;
+    const std::string & frame_id  = is_left ? frame_id_left_         : frame_id_right_;
+    const int           out_w     = eff_out_w(is_left);
+    const int           out_h     = eff_out_h(is_left);
 
+    cv::Mat bgr;
     if (bgra_surf) {
       // ── VIC path: wrap BGRA directly, convert BGRA→BGR (single NEON pass) ──
       auto * bgra_ptr = static_cast<uint8_t *>(
         bgra_surf->surfaceList[0].mappedAddr.addr[0]);
       const size_t pitch = bgra_surf->surfaceList[0].planeParams.pitch[0];
       cv::Mat bgra_mat(combined_height_, ew, CV_8UC4, bgra_ptr, pitch);
-      cv::cvtColor(bgra_mat, bgr, cv::COLOR_BGRA2BGR);  // drops X channel; NEON-vectorised
+      cv::cvtColor(bgra_mat, bgr, cv::COLOR_BGRA2BGR);
     } else {
       // ── CPU fallback: de-stride NV12 + cvtColor ────────────────────────────
       auto * y_src  = static_cast<const uint8_t *>(
@@ -987,21 +1081,40 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
       cv::cvtColor(nv12_mat, bgr, cv::COLOR_YUV2BGR_NV12);
     }
 
-    if (out_w != bgr.cols || out_h != bgr.rows) {
-      cv::resize(bgr, bgr, cv::Size(out_w, out_h));
+    // Apply requested encoding (bgr is already the correct base from cvtColor)
+    cv::Mat out;
+    if (encoding == "rgb8") {
+      cv::cvtColor(bgr, out, cv::COLOR_BGR2RGB);
+    } else {
+      out = bgr;
     }
-    auto img_msg = cv_bridge::CvImage(std_msgs::msg::Header{}, "bgr8", bgr).toImageMsg();
-    img_msg->header.stamp    = stamp;
-    img_msg->header.frame_id = frame_id;
-    pub->publish(std::make_unique<sensor_msgs::msg::Image>(std::move(*img_msg)));
+    if (out_w != out.cols || out_h != out.rows) {
+      cv::resize(out, out, cv::Size(out_w, out_h));
+    }
+
+    std_msgs::msg::Header hdr;
+    hdr.stamp    = stamp;
+    hdr.frame_id = frame_id;
+
+    if (transport == "compressed") {
+      std::vector<uchar> jpeg_buf;
+      cv::imencode(".jpg", out, jpeg_buf, {cv::IMWRITE_JPEG_QUALITY, jpeg_q});
+      sensor_msgs::msg::CompressedImage msg;
+      msg.header = hdr;
+      msg.format = encoding + "; jpeg compressed " + encoding;
+      msg.data   = std::move(jpeg_buf);
+      (is_left ? pub_vis_comp_left_ : pub_vis_comp_right_)->publish(msg);
+    } else {
+      auto img_msg = cv_bridge::CvImage(hdr, encoding, out).toImageMsg();
+      (is_left ? pub_vis_raw_left_ : pub_vis_raw_right_)->publish(
+        std::make_unique<sensor_msgs::msg::Image>(std::move(*img_msg)));
+    }
   };
 
-  if (pub_raw_left_)
-    publish_raw_side(have_raw_surfs ? nvbuf_raw_left_  : nullptr, nvbuf_left_,
-                     pub_left_raw_,  frame_id_left_,  eff_out_w(true),  eff_out_h(true));
-  if (pub_raw_right_)
-    publish_raw_side(have_raw_surfs ? nvbuf_raw_right_ : nullptr, nvbuf_right_,
-                     pub_right_raw_, frame_id_right_, eff_out_w(false), eff_out_h(false));
+  if (vis_enable_left_)
+    publish_visual_side(have_raw_surfs ? nvbuf_raw_left_  : nullptr, nvbuf_left_,  true);
+  if (vis_enable_right_)
+    publish_visual_side(have_raw_surfs ? nvbuf_raw_right_ : nullptr, nvbuf_right_, false);
 
   // ── NITROS publish (GPU-resident zero-copy) ───────────────────────────────
   // cuda_nv12_left_/right_ are real cudaMalloc device pointers for downstream
@@ -1034,10 +1147,12 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
     pub->publish(std::move(nitros_img));
   };
 
-  publish_nitros(cuda_nv12_left_,  pub_left_nitros_,
-                 frame_id_left_,  nitros_fmt_left_,  eff_out_w(true),  eff_out_h(true));
-  publish_nitros(cuda_nv12_right_, pub_right_nitros_,
-                 frame_id_right_, nitros_fmt_right_, eff_out_w(false), eff_out_h(false));
+  if (pub_nitros_left_)
+    publish_nitros(cuda_nv12_left_,  pub_left_nitros_,
+                   frame_id_left_,  nitros_fmt_left_,  eff_out_w_nitros(true),  eff_out_h_nitros(true));
+  if (pub_nitros_right_)
+    publish_nitros(cuda_nv12_right_, pub_right_nitros_,
+                   frame_id_right_, nitros_fmt_right_, eff_out_w_nitros(false), eff_out_h_nitros(false));
 
   return true;
 }
@@ -1194,29 +1309,49 @@ void ArducamDualCamNode::process_sample(GstSample * sample)
     publish_info(pub_right_info_, cam_info_right_, frame_id_right_);
   }
 
-  // image_raw published per-side only when publish_image_raw is enabled
-  auto publish_cpu_raw = [&](
+  // visual_stream published per-side only when visual_stream.enable is true
+  auto publish_cpu_visual = [&](
     cv::Mat & bgr,
-    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr & img_pub,
-    const std::string & frame_id,
-    int out_w, int out_h)
+    bool is_left)
   {
-    cv::Mat final_bgr;
-    if (out_w == bgr.cols && out_h == bgr.rows) {
-      final_bgr = bgr;
+    const std::string & transport = is_left ? vis_transport_left_    : vis_transport_right_;
+    const std::string & encoding  = is_left ? vis_encoding_left_     : vis_encoding_right_;
+    const int           jpeg_q    = is_left ? vis_jpeg_quality_left_ : vis_jpeg_quality_right_;
+    const std::string & frame_id  = is_left ? frame_id_left_         : frame_id_right_;
+    const int           out_w     = eff_out_w(is_left);
+    const int           out_h     = eff_out_h(is_left);
+
+    cv::Mat out;
+    if (encoding == "rgb8") {
+      cv::cvtColor(bgr, out, cv::COLOR_BGR2RGB);
     } else {
-      cv::resize(bgr, final_bgr, cv::Size(out_w, out_h));
+      out = bgr;  // bgr8 default — zero copy
     }
-    auto sp = cv_bridge::CvImage(std_msgs::msg::Header{}, "bgr8", final_bgr).toImageMsg();
-    sp->header.stamp    = stamp;
-    sp->header.frame_id = frame_id;
-    img_pub->publish(std::make_unique<sensor_msgs::msg::Image>(std::move(*sp)));
+    if (out_w != out.cols || out_h != out.rows) {
+      cv::resize(out, out, cv::Size(out_w, out_h));
+    }
+
+    std_msgs::msg::Header hdr;
+    hdr.stamp    = stamp;
+    hdr.frame_id = frame_id;
+
+    if (transport == "compressed") {
+      std::vector<uchar> jpeg_buf;
+      cv::imencode(".jpg", out, jpeg_buf, {cv::IMWRITE_JPEG_QUALITY, jpeg_q});
+      sensor_msgs::msg::CompressedImage msg;
+      msg.header = hdr;
+      msg.format = encoding + "; jpeg compressed " + encoding;
+      msg.data   = std::move(jpeg_buf);
+      (is_left ? pub_vis_comp_left_ : pub_vis_comp_right_)->publish(msg);
+    } else {
+      auto sp = cv_bridge::CvImage(hdr, encoding, out).toImageMsg();
+      (is_left ? pub_vis_raw_left_ : pub_vis_raw_right_)->publish(
+        std::make_unique<sensor_msgs::msg::Image>(std::move(*sp)));
+    }
   };
 
-  if (pub_raw_left_)  publish_cpu_raw(left_bgr,  pub_left_raw_,  frame_id_left_,
-                        eff_out_w(true),  eff_out_h(true));
-  if (pub_raw_right_) publish_cpu_raw(right_bgr, pub_right_raw_, frame_id_right_,
-                        eff_out_w(false), eff_out_h(false));
+  if (vis_enable_left_)  publish_cpu_visual(left_bgr,  true);
+  if (vis_enable_right_) publish_cpu_visual(right_bgr, false);
 }
 
 }  // namespace arducam_dual_camera
