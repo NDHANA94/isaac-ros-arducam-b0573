@@ -1,0 +1,9 @@
+%YAML 1.2
+# Minimal GXF context graph for arducam_dual_camera.
+# This graph is loaded by init_nitros_context() solely to satisfy the GXF
+# runtime requirement for a valid application.  It contains no components;
+# the scheduler warning ("No GXF scheduler specified") is expected and harmless.
+# The actual purpose is to register nvidia::gxf::VideoBuffer (and related types)
+# into the shared GXF context via the cuda + multimedia extensions loaded before
+# this graph is applied.
+---
