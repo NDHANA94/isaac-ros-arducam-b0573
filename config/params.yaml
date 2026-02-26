@@ -1,0 +1,56 @@
+arducam_dual_cam_node:
+  ros__parameters:
+    # V4L2 device node
+    device: "/dev/video0"
+
+    # Combined (side-by-side) resolution.
+    # Arducam B0573 available modes:
+    #   3840 × 1200  →  1920 × 1200 per eye
+    #   2560 ×  720  →  1280 ×  720 per eye  (default)
+    #   1280 ×  480  →   640 ×  480 per eye
+    width:  1280
+    height: 480
+
+    # Target frame rate (0 = let the V4L2 driver negotiate)
+    fps: 30
+
+    # Input pixel format reported by v4l2-ctl: UYVY or NV16
+    pixel_format: "UYVY"
+
+    # TF frame IDs stamped into every Image and CameraInfo message
+    frame_id_left:  "left_camera"
+    frame_id_right: "right_camera"
+
+    # Camera names (used by camera_info_manager to key the calibration store)
+    camera_namespace: "arducam" # Namespace for camera_info_manager (e.g. "arducam").  The full camera name is then "arducam/left" and "arducam/right".
+    camera_name_left:  "left"
+    camera_name_right: "right"
+
+    # camera topic QoS
+    qos:
+      # Reliability: "best_effort" or "reliable"
+      reliability: "reliable"
+      # Durability: "volatile" or "transient_local"
+      #   - volatile: Subscribers only receive messages published while they are active.
+      #   - transient_local: Subscribers receive the last published message upon subscription, and then continue
+      #       when to use volatile vs transient_local:
+      #       - Use volatile for streaming data like camera images, where late-joining subscribers don't need the last frame.
+      #       - Use transient_local for static or infrequently changing data like camera calibration, where late-joining subscribers should receive the last known calibration.
+      durability: "volatile"
+
+
+    # Calibration file URLs for camera_info_manager.
+    # Leave empty ("") to publish uncalibrated (identity) camera_info.
+    # Supported URL schemes:
+    #   file:///absolute/path/to/left.yaml
+    #   package://arducam_dual_camera/config/left_camera.yaml
+    #
+    # Sample files are provided in config/left_camera.yaml and right_camera.yaml.
+    # Replace the placeholder values with your actual stereo calibration results
+    # (e.g. from: ros2 run camera_calibration cameracalibrator).
+    #
+    # Uncomment the lines below to load the sample calibration files:
+    # calib_url_left:  "package://arducam_dual_camera/config/calib_left_cam.yaml"
+    # calib_url_right: "package://arducam_dual_camera/config/calib_right_cam.yaml"
+    calib_url_left: "file:///home/orin/workspace/ros2_ws/src/arducam_dual_camera/config/calib_left_cam.yaml"
+    calib_url_right: "file:///home/orin/workspace/ros2_ws/src/arducam_dual_camera/config/calib_right_cam.yaml"
