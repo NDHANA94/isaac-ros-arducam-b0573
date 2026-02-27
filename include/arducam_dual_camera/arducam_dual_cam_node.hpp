@@ -28,17 +28,16 @@
 #include <tf2/LinearMath/Quaternion.h>
 
 // NvBufSurface/NvBufSurfTransform: VIC-native zero-copy NVMM API (DeepStream 7)
-// Isaac ROS NITROS: GPU-resident NvBufSurface → zero-copy ROS transport
+// Isaac ROS NITROS: TypeAdapter path — publish sensor_msgs::msg::Image on a
+// rclcpp::Publisher<NitrosImage>; convert_to_custom() creates a lifecycle-managed
+// GXF VideoBuffer without any cudaMalloc or NitrosImageBuilder involvement.
 #ifdef HAVE_NVBUF
 #include <nvbufsurface.h>
 #include <nvbufsurftransform.h>
-#include <cuda_runtime_api.h>
-// NitrosImage: wraps a CUDA device-memory buffer in a GXF VideoBuffer.
-// A co-located NITROS subscriber (same process) receives the GPU handle
-// without any host DMA; inter-process subscribers get auto-serialised.
+// NitrosImage TypeAdapter: rclcpp::TypeAdapter<NitrosImage, sensor_msgs::msg::Image>
+// Publishing sensor_msgs::msg::Image on Publisher<NitrosImage> triggers
+// convert_to_custom() which allocates and frees the GXF VideoBuffer correctly.
 #include "isaac_ros_nitros_image_type/nitros_image.hpp"
-#include "isaac_ros_nitros_image_type/nitros_image_builder.hpp"
-#include "isaac_ros_nitros/nitros_context.hpp"
 #endif
 
 namespace arducam_dual_camera
@@ -192,46 +191,31 @@ private:
   //
   // process_sample_nvbuf():
   //   1. gst_buffer_map(NVMM) → NvBufSurface* src  [O(1), no pixel copy]
-  //   2. NvBufSurfTransformAsync ×2 → VIC NV12→NV12 crop per eye
-  //      (pure geometric op, no colour conversion — VIC handles it natively)
-  //   3. Wait for both VIC sync objects.
-  //   4. gst_buffer_unmap — release NVMM src reference.
-  //   5. nvbuf_{left,right}_->surfaceList[0].dataPtr → CUDA device pointer.
-  //   6. NitrosImageBuilder::WithGpuData(cuda_ptr) → NitrosImage  [zero host copy]
-  //   7. pub_{left,right}_->publish(nitros_img)  — GPU handle delivered zero-copy
-  //      to co-located NITROS subscribers.
+  //   2. NvBufSurfTransform (sync) ×2 → VIC NV12 crop per eye
+  //   3. NvBufSurfTransformAsync ×2 → VIC NV12→BGRA crop per eye (visual_stream)
+  //   4. Wait for BGRA VIC sync objects.  gst_buffer_unmap.
+  //   5. NvBufSurfaceSyncForCpu (all planes) ×4 — flush CPU cache coherency.
+  //   6. Build sensor_msgs::msg::Image: std::memcpy NV12 from mappedAddr (stride-strip).
+  //   7. pub_{left,right}_nitros_->publish(ros_img)  → TypeAdapter convert_to_custom()
+  //      allocates a lifecycle-managed GXF VideoBuffer; freed after consumption.
 #ifdef HAVE_NVBUF
-  // GXF shared context required by NitrosImageBuilder::Build() to allocate
-  // GXF VideoBuffer entities.  Initialised in the constructor.
-  nvidia::isaac_ros::nitros::NitrosContext nitros_ctx_;
+  // GXF shared context is managed transparently by the NitrosImage TypeAdapter.
+  // We do NOT hold a NitrosContext here — explicit context management caused the
+  // 16-entity GXF pool exhaustion (NitrosImageBuilder::Build() leaked one entity
+  // per call; 2 sides × 8 frames = 16 = pool full = SIGSEGV).
 
   bool           use_nvbuf_{false};       // true once surfaces allocated successfully
 
-  // NV12 SURFACE_ARRAY VIC dst — used for NITROS zero-copy publish path.
+  // NV12 SURFACE_ARRAY VIC dst — used for NITROS publish path.
   NvBufSurface * nvbuf_left_{nullptr};
   NvBufSurface * nvbuf_right_{nullptr};
 
   // BGRA SURFACE_ARRAY VIC dst — used for image_raw (rviz2) publish path.
-  // VIC converts NV12→BGRA in the same hardware pass as the crop, so the CPU
-  // never runs cvtColor or a stride-removal memcpy loop.
-  // mappedAddr.addr[0] is a packed BGRA row-major pointer (pitch from planeParams)
-  // that can be wrapped directly as cv::Mat(h, w, CV_8UC4, addr, pitch) — zero alloc.
   NvBufSurface * nvbuf_raw_left_{nullptr};
   NvBufSurface * nvbuf_raw_right_{nullptr};
-  // Packed NV12 CUDA device buffers (cudaMalloc eye_w×h×3/2 bytes each).
-  // After each VIC transform, cudaMemcpy2D copies Y+UV from the CPU-mapped
-  // SURFACE_ARRAY into these, then NitrosImageBuilder::WithGpuData() wraps them.
-  // On Jetson iGPU (unified LPDDR5), the cudaMemcpy2D is a coherence op only;
-  // no physical data moves between GPU and a "separate" CPU.
-  void *         cuda_nv12_left_{nullptr};
-  void *         cuda_nv12_right_{nullptr};
 
   // Allocate NV12 CUDA-device NvBufSurfaces per eye; set use_nvbuf_ = true.
   void init_nvbuf_surfaces();
-  // Load GXF cuda + multimedia extensions into the shared context so that
-  // NitrosImageBuilder::Build() can create nvidia::gxf::VideoBuffer entities.
-  // Must be called before the first Build() call (i.e. before the capture loop).
-  void init_nitros_context();
   void cleanup_nvbuf_surfaces();
 
   // Returns true if the VIC path completed successfully; false causes

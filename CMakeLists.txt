@@ -38,7 +38,6 @@ find_package(OpenCV REQUIRED)
 # if the variable HAVE_NVBUF is ultimately false (the headers are not included).
 find_package(isaac_ros_nitros REQUIRED)
 find_package(isaac_ros_nitros_image_type REQUIRED)
-find_package(ament_index_cpp REQUIRED)
 
 # ── GStreamer (system) ────────────────────────────────────────────────────────
 find_package(PkgConfig REQUIRED)
@@ -77,7 +76,6 @@ set(ROS_DEPS
   tf2_ros
   isaac_ros_nitros
   isaac_ros_nitros_image_type
-  ament_index_cpp
 )
 
 # ── Composable component shared library ───────────────────────────────────────

@@ -43,9 +43,9 @@ arducam_dual_cam_node:
         nitros_image:
           enable: true
           qos:
-            reliability: "best_effort"   # NITROS zero-copy works well with best_effort
+            reliability: "reliable"      # NITROS zero-copy works well with best_effort --- (reliable | best_effort)
             durability: "volatile"       # volatile | transient_local
-          format: "nv12"                 # Supported: "nv12" (native VIC output, lowest bandwidth), "nv24", "rgb8", "bgr8"
+          format: "rgb8"                 # Supported: "nv12" (native VIC output, lowest bandwidth), "nv24", "rgb8", "bgr8"
           fps: 30                        # Target frame rate for publishing the NITROS image stream. Actual frame rate may be lower if the camera cannot keep up.          
           resolution:                    # Resolution for the NITROS image stream. If width or height is set to -1, it will use the full capture resolution for that dimension.
             width: -1
@@ -121,9 +121,9 @@ arducam_dual_cam_node:
         nitros_image:
           enable: true
           qos:
-            reliability: "best_effort"   # NITROS zero-copy works well with best_effort
+            reliability: "reliable"   # NITROS zero-copy works well with best_effort
             durability: "volatile"       # volatile | transient_local
-          format: "nv12"                 # Supported: "nv12" (native VIC output, lowest bandwidth), "nv24", "rgb8", "bgr8"
+          format: "rgb8"                 # Supported: "nv12" (native VIC output, lowest bandwidth), "nv24", "rgb8", "bgr8"
           fps: 30                        # Target frame rate for publishing the NITROS image stream. Actual frame rate may be lower if the camera cannot keep up.
           resolution:                    # Resolution for the NITROS image stream. If width or height is set to -1, it will use the full capture resolution for that dimension.
             width: -1

@@ -18,20 +18,20 @@
  *   NV12 per-eye NvBufSurfaces entirely in VIC hardware.
  *
  * Isaac ROS NITROS  (HAVE_NVBUF path)
- *   NitrosImageBuilder::WithGpuData(cuda_ptr)->Build() wraps the per-eye
- *   NvBufSurface CUDA device pointer in a GXF VideoBuffer and publishes it.
- *   A co-located downstream NITROS node (e.g. isaac_ros_image_proc)
- *   receives the GXF handle with ZERO host DMA — the NV12 frame stays
- *   resident in GPU LPDDR5 from capture all the way through to inference.
+ *   Publishing sensor_msgs::msg::Image on rclcpp::Publisher<NitrosImage> triggers
+ *   the TypeAdapter's convert_to_custom(), which copies the NV12 data from the
+ *   CPU-mapped NvBufSurface into a lifecycle-managed GXF VideoBuffer and delivers
+ *   it to downstream NITROS nodes.
  *
  *   Pipeline bandwidth comparison at 2560×720 @ 30 fps:
- *     NV12 NITROS:  2.77 MB/frame = 83 MB/s  (GPU only, zero host copy)  ← preferred
- *     BGRx CPU:     7.37 MB/frame = 221 MB/s on LPDDR5                   ← fallback
+ *     NV12 NITROS:  2.77 MB/frame = 83 MB/s  (TypeAdapter path)    ← preferred
+ *     BGRx CPU:     7.37 MB/frame = 221 MB/s on LPDDR5              ← fallback
  *
  *   NITROS path CPU cost:
- *     NvBufSurfTransformAsync() housekeeping (µs)
- *     NitrosImageBuilder::Build()             (GXF entity alloc, µs)
- *     ZERO cv_bridge / cv::cvtColor / memcpy
+ *     NvBufSurfTransform() housekeeping (µs)
+ *     std::memcpy stride-strip NV12 into sensor_msgs::msg::Image (µs)
+ *     TypeAdapter convert_to_custom() GXF VideoBuffer alloc (µs)
+ *     ZERO NitrosImageBuilder / GXF entity pool allocation
  *
  * CPU fallback (HAVE_NVBUF not defined, or NVMM not negotiated)
  *   v4l2src BGRx + gst_buffer_map copy to CPU + cv::cvtColor × 2.
@@ -54,8 +54,8 @@
  *   /arducam/right/image_raw             sensor_msgs/Image   bgr8, when transport=raw
  *   /arducam/left/camera_info            sensor_msgs/CameraInfo, always
  *   /arducam/right/camera_info           sensor_msgs/CameraInfo, always
- *   /arducam/left/nitros_image_<fmt>     NitrosImage  GPU-resident (format-configurable), HAVE_NVBUF only
- *   /arducam/right/nitros_image_<fmt>    NitrosImage  GPU-resident (format-configurable), HAVE_NVBUF only
+ *   /arducam/left/nitros_image_nv12      NitrosImage  NV12 GPU-resident, HAVE_NVBUF only
+ *   /arducam/right/nitros_image_nv12     NitrosImage  NV12 GPU-resident, HAVE_NVBUF only
  *
  * Parameters:
  *   device              (string)  /dev/video0
@@ -75,7 +75,7 @@
  *     .topics.visual_stream.resolution.{width,height} int  -1 = same as capture
  *     .topics.nitros_image.enable             bool     true
  *     .topics.nitros_image.qos.{reliability,durability}  string
- *     .topics.nitros_image.format             string   nv12 | nv24 | rgb8 | bgr8
+ *     .topics.nitros_image.format             string   nv12 | rgb8 | bgr8
  *     .topics.nitros_image.resolution.{width,height} int  -1 = same as capture
  *     .topics.camera_info.qos.{reliability,durability}  string
  *     .extrinsics.relative_to          string   base_link
@@ -93,14 +93,14 @@
 #include <opencv2/opencv.hpp>
 #include <cv_bridge/cv_bridge.h>
 
-// NITROS: used for GPU-resident NitrosImage publishing in the HAVE_NVBUF path.
-// sensor_msgs/Image publishers remain for the CPU fallback path.
+// NITROS: NitrosImage is a TypeAdapter over sensor_msgs::msg::Image.
+// Publishing sensor_msgs::msg::Image on an rclcpp::Publisher<NitrosImage>
+// triggers convert_to_custom() in the TypeAdapter, which creates a
+// lifecycle-managed GXF VideoBuffer (freed after all subscribers consume it).
+// This avoids the 16-entity pool exhaustion from NitrosImageBuilder::Build().
 #ifdef HAVE_NVBUF
-#include "isaac_ros_nitros_image_type/nitros_image_builder.hpp"
-using NitrosImageBuilder = nvidia::isaac_ros::nitros::NitrosImageBuilder;
+#include "isaac_ros_nitros_image_type/nitros_image.hpp"
 using nvidia::isaac_ros::nitros::NitrosImage;
-#include "gxf/core/gxf.h"
-#include <ament_index_cpp/get_package_share_directory.hpp>
 #endif
 
 #include <gst/gst.h>
@@ -205,7 +205,7 @@ ArducamDualCamNode::ArducamDualCamNode(const rclcpp::NodeOptions & options)
                                                                : pfx_r + "/image_raw";
     topic_left_info_  = (vis_transport_left_  == "compressed") ? pfx_l + "/image/camera_info"
                                                                 : pfx_l + "/camera_info";    
-    topic_right_info_ = (vis_transport_right_ == "compressed") ? pfx_r + "/image/camera_info"
+    topic_right_info_ = (vis_transport_left_  == "compressed") ? pfx_r + "/image/camera_info"
                                                                 : pfx_r + "/camera_info"; 
   }
 
@@ -318,13 +318,13 @@ ArducamDualCamNode::ArducamDualCamNode(const rclcpp::NodeOptions & options)
     topic_right_info_, make_qos(qos_info_rel_right_, qos_info_dur_right_));
 
   // ── NITROS publishers (GPU-resident zero-copy, HAVE_NVBUF only) ────────────────
-  // Topic suffix derived from nitros_image.format so the topic name always reflects
-  // the declared encoding.  Supported NitrosImageBuilder encodings: "nv12", "nv24", "rgb8", "bgr8"
+  // Topic name is fully specified by {left,right}_camera.topics.nitros_image.topic_name.
+  // Supported NitrosImageBuilder encodings: "nv12", "rgb8", "bgr8"
 #ifdef HAVE_NVBUF
   topic_left_nitros_  = get_parameter("left_camera.topics.topic_name_prefix").as_string()
-                        + "/nitros_image_" + nitros_fmt_left_;
+                        + "/nitros_image_nv12";
   topic_right_nitros_ = get_parameter("right_camera.topics.topic_name_prefix").as_string()
-                        + "/nitros_image_" + nitros_fmt_right_;
+                        + "/nitros_image_nv12";
   if (pub_nitros_left_) {
     pub_left_nitros_  = create_publisher<NitrosImage>(
       topic_left_nitros_,  make_qos(qos_nitros_rel_left_,  qos_nitros_dur_left_));
@@ -358,7 +358,8 @@ ArducamDualCamNode::ArducamDualCamNode(const rclcpp::NodeOptions & options)
   gst_init(&argc, &argv);
 
 #ifdef HAVE_NVBUF
-  init_nitros_context();   // load cuda + multimedia GXF extensions before first Build()
+  // No explicit GXF context init needed: the NitrosImage TypeAdapter registers
+  // its own context when the first subscriber negotiates format.
 #endif
 
   build_pipeline();   // also calls init_nvbuf_surfaces() when HAVE_NVBUF
@@ -393,7 +394,6 @@ ArducamDualCamNode::~ArducamDualCamNode()
 
 #ifdef HAVE_NVBUF
   cleanup_nvbuf_surfaces();
-  nitros_ctx_.destroy();
 #endif
 }
 
@@ -668,66 +668,6 @@ void ArducamDualCamNode::build_pipeline()
 // ─────────────────────────────────────────────────────────────────────────────
 #ifdef HAVE_NVBUF
 
-// ── init_nitros_context() ─────────────────────────────────────────────────────
-// Pre-registers nvidia::gxf::VideoBuffer (and cuda types) in the shared GXF
-// context so NitrosImageBuilder::Build() can allocate GXF entities.
-//
-// NitrosImageBuilder::Build() lazily creates a NitrosContext and loads:
-//   std / isaac_gxf_helpers / isaac_sight / isaac_atlas
-// but does NOT load gxf_cuda or gxf_multimedia, so VideoBuffer is unknown
-// and GXF panics.  Loading those two extensions here, before the first
-// Build() call, fixes the panic — the shared GXF context is global, so
-// extensions loaded via our nitros_ctx_ instance are visible to Build().
-//
-// Pattern mirrors isaac_ros_argus_camera:GetArgusNitrosContext().
-void ArducamDualCamNode::init_nitros_context()
-{
-  const std::string gxf_dir =
-    ament_index_cpp::get_package_share_directory("isaac_ros_gxf");
-
-  // Load std first — registers nvidia::gxf::Allocator and System types that
-  // gxf_cuda depends on.  Skipping this causes GXF_FACTORY_UNKNOWN_CLASS_NAME
-  // when gxf_cuda tries to register its CudaAllocator component.
-  gxf_result_t r = nitros_ctx_.loadExtension(gxf_dir, "gxf/lib/std/libgxf_std.so");
-  if (r != GXF_SUCCESS) {
-    RCLCPP_WARN(get_logger(),
-      "init_nitros_context: loadExtension(gxf_std) returned %d", r);
-  }
-
-  // Load CUDA extension — prerequisite for gxf_multimedia's CUDA buffer types.
-  r = nitros_ctx_.loadExtension(gxf_dir, "gxf/lib/cuda/libgxf_cuda.so");
-  if (r != GXF_SUCCESS) {
-    RCLCPP_WARN(get_logger(),
-      "init_nitros_context: loadExtension(gxf_cuda) returned %d — VideoBuffer may panic", r);
-  }
-
-  // Load multimedia extension — registers nvidia::gxf::VideoBuffer.
-  r = nitros_ctx_.loadExtension(gxf_dir, "gxf/lib/multimedia/libgxf_multimedia.so");
-  if (r != GXF_SUCCESS) {
-    RCLCPP_WARN(get_logger(),
-      "init_nitros_context: loadExtension(gxf_multimedia) returned %d — VideoBuffer may panic", r);
-  }
-
-  // Load a minimal graph (empty — no schedulable entities); satisfies loadApplication
-  // requirement before runGraphAsync().  "No GXF scheduler" warning is expected.
-  const std::string pkg_dir =
-    ament_index_cpp::get_package_share_directory("arducam_dual_camera");
-  r = nitros_ctx_.loadApplication(pkg_dir + "/config/nitros_context_graph.yaml");
-  if (r != GXF_SUCCESS) {
-    RCLCPP_WARN(get_logger(),
-      "init_nitros_context: loadApplication returned %d", r);
-  }
-
-  r = nitros_ctx_.runGraphAsync();
-  if (r != GXF_SUCCESS) {
-    RCLCPP_WARN(get_logger(),
-      "init_nitros_context: runGraphAsync returned %d", r);
-  }
-
-  RCLCPP_INFO(get_logger(),
-    "NITROS context: gxf_std + gxf_cuda + gxf_multimedia loaded (VideoBuffer registered)");
-}
-
 // ── init_nvbuf_surfaces() ─────────────────────────────────────────────────────
 // Pre-allocates two NV12 SURFACE_ARRAY destination NvBufSurfaces (one per eye).
 //
@@ -814,35 +754,12 @@ void ArducamDualCamNode::init_nvbuf_surfaces()
     }
   }
 
-  // Allocate packed NV12 CUDA device buffers (Y plane + interleaved UV plane).
-  // These are real cudaMalloc allocations whose pointers are valid CUDA device
-  // addresses — required by VPI (called inside NitrosImageBuilder::Build()).
-  // SURFACE_ARRAY dataPtr is a CPU nvmap virtual address that VPI rejects with
-  // cudaErrorInvalidValue in cudaPointerAttributes(); cudaMalloc buffers pass.
-  const size_t nv12_size = static_cast<size_t>(eye_width()) *
-                           static_cast<size_t>(combined_height_) * 3 / 2;
-  cudaError_t ce_l = cudaMalloc(&cuda_nv12_left_,  nv12_size);
-  cudaError_t ce_r = cudaMalloc(&cuda_nv12_right_, nv12_size);
-  if (ce_l != cudaSuccess || ce_r != cudaSuccess) {
-    RCLCPP_WARN(get_logger(),
-      "cudaMalloc NV12 staging buf failed (l=%d r=%d) — VIC path disabled",
-      static_cast<int>(ce_l), static_cast<int>(ce_r));
-    NvBufSurfaceUnMap(nvbuf_left_,  0, -1);
-    NvBufSurfaceUnMap(nvbuf_right_, 0, -1);
-    NvBufSurfaceDestroy(nvbuf_left_);  nvbuf_left_  = nullptr;
-    NvBufSurfaceDestroy(nvbuf_right_); nvbuf_right_ = nullptr;
-    if (cuda_nv12_left_)  { cudaFree(cuda_nv12_left_);  cuda_nv12_left_  = nullptr; }
-    if (cuda_nv12_right_) { cudaFree(cuda_nv12_right_); cuda_nv12_right_ = nullptr; }
-    return;
-  }
-
   use_nvbuf_ = true;
   RCLCPP_INFO(get_logger(),
     "NvBufSurface ready  eye=%dx%d"
-    "  NITROS staging(NV12): cuda_left=%p cuda_right=%p  buf=%zu B"
-    "  BGRA(visual_stream): %s",  // staging is always NV12; NitrosImageBuilder.WithEncoding sets declared fmt
+    "  NV12(NITROS): CPU-mapped via TypeAdapter"
+    "  BGRA(image_raw): %s",
     eye_width(), combined_height_,
-    cuda_nv12_left_, cuda_nv12_right_, nv12_size,
     (nvbuf_raw_left_ && nvbuf_raw_right_) ? "VIC hw path" : "CPU cvtColor fallback");
 }
 
@@ -869,8 +786,6 @@ void ArducamDualCamNode::cleanup_nvbuf_surfaces()
     NvBufSurfaceDestroy(nvbuf_raw_right_);
     nvbuf_raw_right_ = nullptr;
   }
-  if (cuda_nv12_left_)  { cudaFree(cuda_nv12_left_);  cuda_nv12_left_  = nullptr; }
-  if (cuda_nv12_right_) { cudaFree(cuda_nv12_right_); cuda_nv12_right_ = nullptr; }
   use_nvbuf_ = false;
 }
 
@@ -879,16 +794,14 @@ void ArducamDualCamNode::cleanup_nvbuf_surfaces()
 //
 // Memory flow:
 //   gst_buffer_map(NVMM) → NvBufSurface* src     [O(1), 64-byte struct]
-//   NvBufSurfTransformAsync ×2  → VIC NV12 crop → nvbuf_left_ / nvbuf_right_
+//   NvBufSurfTransform (sync)  → VIC NV12 crop → nvbuf_left_ / nvbuf_right_
 //     (SURFACE_ARRAY — the only dst type VIC accepts on Orin)
-//   Wait sync objects → gst_buffer_unmap
-//   NvBufSurfaceSyncForCpu ×2   → ensure CPU view is coherent
-//   cudaMemcpy2D Y+UV planes    → cuda_nv12_left_ / cuda_nv12_right_
-//     (SURFACE_ARRAY dataPtr is CPU nvmap virtual addr; VPI rejects it with
-//      cudaErrorInvalidValue; we bridge to real cudaMalloc device memory)
-//     On Jetson iGPU (unified LPDDR5) this is coherence-bookkeeping only.
-//   NitrosImageBuilder::WithGpuData(cuda_nv12_*)->Build() → NitrosImage
-//   pub_{left,right}_->publish(nitros_img)  → GXF VideoBuffer delivered
+//   NvBufSurfTransformAsync    → VIC NV12→BGRA crop → nvbuf_raw_{left,right}_
+//   Wait BGRA sync objects → gst_buffer_unmap
+//   NvBufSurfaceSyncForCpu ×4  → ensure CPU view is coherent (all planes)
+//   Build sensor_msgs::msg::Image from mappedAddr (std::memcpy, stride-strip)
+//   pub_{left,right}_nitros_->publish(ros_img)  → TypeAdapter convert_to_custom()
+//     creates a lifecycle-managed GXF VideoBuffer; freed after consumption.
 //
 // Returns false if any VIC operation fails; caller rebuilds to CPU pipeline.
 bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Time & stamp)
@@ -918,15 +831,28 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
   tp_right.transform_filter = NvBufSurfTransformInter_Nearest;
   tp_right.src_rect         = &rect_right;
 
-  NvBufSurfTransformSyncObj_t sync_left  = nullptr;
-  NvBufSurfTransformSyncObj_t sync_right = nullptr;
+  // ── NV12 crop (NITROS path) — synchronous NvBufSurfTransform ───────────────
+  // NvBufSurfTransformAsync requires a VIC session pre-configured via
+  // NvBufSurfTransformSetSessionParams.  Without it the call returns Success but
+  // submits no work and the sync object never fires — resulting in stale
+  // (zero-initialised) NV12 data reaching the CUDA staging buffer and a green
+  // screen in RViz2.  The synchronous API blocks until VIC completes and has
+  // no session requirement; it is the correct API for per-frame use here.
+  auto err_l = NvBufSurfTransform(src, nvbuf_left_,  &tp_left);
+  auto err_r = NvBufSurfTransform(src, nvbuf_right_, &tp_right);
 
-  auto err_l = NvBufSurfTransformAsync(src, nvbuf_left_,  &tp_left,  &sync_left);
-  auto err_r = NvBufSurfTransformAsync(src, nvbuf_right_, &tp_right, &sync_right);
+  if (err_l != NvBufSurfTransformError_Success ||
+      err_r != NvBufSurfTransformError_Success)
+  {
+    RCLCPP_WARN_ONCE(get_logger(),
+      "NvBufSurfTransform (NV12) failed (err_l=%d err_r=%d) — "
+      "disabling VIC path", static_cast<int>(err_l), static_cast<int>(err_r));
+    gst_buffer_unmap(buf, &map);
+    use_nvbuf_ = false;
+    return false;
+  }
 
-  // ── image_raw VIC path: NV12→BGRA crop in the same hardware pass ───────────
-  // Kick off both BGRA transforms before waiting on ANY sync object so all four
-  // VIC jobs run concurrently.  sync_raw_* are only used if nvbuf_raw_* allocated.
+  // ── image_raw VIC path: NV12→BGRA crop (async, session not required for FILTER path) ─
   const bool want_raw = vis_enable_left_ || vis_enable_right_;
   const bool have_raw_surfs = nvbuf_raw_left_ && nvbuf_raw_right_;
   NvBufSurfTransformSyncObj_t sync_raw_left  = nullptr;
@@ -939,30 +865,20 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
     NvBufSurfTransformParams tp_raw_right = tp_right;
     tp_raw_left.transform_flag  |= NVBUFSURF_TRANSFORM_FILTER;
     tp_raw_right.transform_flag |= NVBUFSURF_TRANSFORM_FILTER;
-    NvBufSurfTransformAsync(src, nvbuf_raw_left_,  &tp_raw_left,  &sync_raw_left);
-    NvBufSurfTransformAsync(src, nvbuf_raw_right_, &tp_raw_right, &sync_raw_right);
+    auto err_raw_l = NvBufSurfTransformAsync(src, nvbuf_raw_left_,  &tp_raw_left,  &sync_raw_left);
+    auto err_raw_r = NvBufSurfTransformAsync(src, nvbuf_raw_right_, &tp_raw_right, &sync_raw_right);
+    if (err_raw_l != NvBufSurfTransformError_Success ||
+        err_raw_r != NvBufSurfTransformError_Success) {
+      RCLCPP_WARN_ONCE(get_logger(),
+        "NvBufSurfTransformAsync (BGRA/image_raw) failed (err_l=%d err_r=%d)"
+        " — visual_stream will use CPU fallback this frame",
+        static_cast<int>(err_raw_l), static_cast<int>(err_raw_r));
+      if (sync_raw_left)  { NvBufSurfTransformSyncObjDestroy(&sync_raw_left);  sync_raw_left  = nullptr; }
+      if (sync_raw_right) { NvBufSurfTransformSyncObjDestroy(&sync_raw_right); sync_raw_right = nullptr; }
+    }
   }
 
-  if (err_l != NvBufSurfTransformError_Success ||
-      err_r != NvBufSurfTransformError_Success)
-  {
-    RCLCPP_WARN_ONCE(get_logger(),
-      "NvBufSurfTransformAsync (NV12) failed (err_l=%d err_r=%d) — "
-      "disabling VIC path", static_cast<int>(err_l), static_cast<int>(err_r));
-    if (sync_left)       NvBufSurfTransformSyncObjDestroy(&sync_left);
-    if (sync_right)      NvBufSurfTransformSyncObjDestroy(&sync_right);
-    if (sync_raw_left)   NvBufSurfTransformSyncObjDestroy(&sync_raw_left);
-    if (sync_raw_right)  NvBufSurfTransformSyncObjDestroy(&sync_raw_right);
-    gst_buffer_unmap(buf, &map);
-    use_nvbuf_ = false;
-    return false;
-  }
-
-  // Wait for all VIC jobs — NV12 staging (NITROS) and BGRA (visual_stream) run concurrently
-  NvBufSurfTransformSyncObjWait(sync_left,  -1);
-  NvBufSurfTransformSyncObjWait(sync_right, -1);
-  NvBufSurfTransformSyncObjDestroy(&sync_left);
-  NvBufSurfTransformSyncObjDestroy(&sync_right);
+  // Wait for BGRA async jobs (NV12 is already done — synchronous above)
   if (sync_raw_left)  {
     NvBufSurfTransformSyncObjWait(sync_raw_left,  -1);
     NvBufSurfTransformSyncObjDestroy(&sync_raw_left);
@@ -974,46 +890,18 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
 
   gst_buffer_unmap(buf, &map);  // release NVMM src reference; dst is independent
 
-  // ── CPU-sync then copy SURFACE_ARRAY → CUDA device buffers ─────────────────
-  // SURFACE_ARRAY (nvmap) dataPtr is a CPU virtual address, NOT a CUDA device
-  // pointer.  VPI calls cudaPointerAttributes() inside NitrosImageBuilder and
-  // gets cudaErrorInvalidValue, crashing.  Bridge: sync CPU view with
-  // NvBufSurfaceSyncForCpu, then use cudaMemcpy2D (Y + UV separately, because
-  // SURFACE_ARRAY has padding per-plane) into pre-allocated cudaMalloc buffers.
-  // On Jetson iGPU (unified LPDDR5) this is coherence-bookkeeping, not a real
-  // DMA copy — the physical pages are the same.
-  // Sync CPU view: NV12 surfaces (for cudaMemcpy2D) and BGRA surfaces (for cv::Mat wrap)
-  NvBufSurfaceSyncForCpu(nvbuf_left_,  0, 0);
-  NvBufSurfaceSyncForCpu(nvbuf_right_, 0, 0);
+  // ── CPU-sync the NV12 surfaces so mappedAddr.addr[] is coherent ──────────────
+  // NvBufSurfaceSyncForCpu with planeIdx=-1 flushes ALL planes (Y + UV).
+  // Using planeIdx=0 only flushes the Y plane; UV retains zero-initialised cache
+  // lines → BT.601 matrix yields R≈0, B≈0, G≈Y+135 → green screen.
+  // Also sync BGRA surfaces for the visual_stream CPU path.
+  NvBufSurfaceSyncForCpu(nvbuf_left_,  0, -1);   // -1 = all planes (Y + UV)
+  NvBufSurfaceSyncForCpu(nvbuf_right_, 0, -1);
   if (have_raw_surfs && want_raw) {
-    NvBufSurfaceSyncForCpu(nvbuf_raw_left_,  0, 0);
-    NvBufSurfaceSyncForCpu(nvbuf_raw_right_, 0, 0);
+    // BGRA is a single packed plane; -1 == 0 here but is more explicit.
+    NvBufSurfaceSyncForCpu(nvbuf_raw_left_,  0, -1);
+    NvBufSurfaceSyncForCpu(nvbuf_raw_right_, 0, -1);
   }
-
-  // Copy NV12 planes (with stride removal) into packed cudaMalloc buffer.
-  // dst layout: [Y: ew*h bytes][UV: ew*(h/2) bytes] — stride == ew (no padding).
-  auto copy_nv12_to_cuda = [&](NvBufSurface * surf, void * cuda_dst, int ew, int h) {
-    auto * y_src  = static_cast<const uint8_t *>(surf->surfaceList[0].mappedAddr.addr[0]);
-    auto * uv_src = static_cast<const uint8_t *>(surf->surfaceList[0].mappedAddr.addr[1]);
-    const size_t spitch_y  = surf->surfaceList[0].planeParams.pitch[0];
-    const size_t spitch_uv = surf->surfaceList[0].planeParams.pitch[1];
-    auto * dst = static_cast<uint8_t *>(cuda_dst);
-    // Y plane: ew columns × h rows, src stride may have HW padding
-    cudaMemcpy2D(dst,             static_cast<size_t>(ew), y_src,  spitch_y,
-                 static_cast<size_t>(ew), static_cast<size_t>(h),
-                 cudaMemcpyHostToDevice);
-    // UV plane: ew columns × (h/2) rows (interleaved U/V, each row is ew bytes)
-    cudaMemcpy2D(dst + ew * h,    static_cast<size_t>(ew), uv_src, spitch_uv,
-                 static_cast<size_t>(ew), static_cast<size_t>(h / 2),
-                 cudaMemcpyHostToDevice);
-  };
-  copy_nv12_to_cuda(nvbuf_left_,  cuda_nv12_left_,  ew, combined_height_);
-  copy_nv12_to_cuda(nvbuf_right_, cuda_nv12_right_, ew, combined_height_);
-
-  RCLCPP_INFO_ONCE(get_logger(),
-    "NITROS NV12 publish via cudaMemcpy2D bridge:"
-    " cuda_nv12_left=%p  cuda_nv12_right=%p  eye=%dx%d",
-    cuda_nv12_left_, cuda_nv12_right_, ew, combined_height_);
 
   // ── Always publish camera_info ────────────────────────────────────────────
   auto pub_cam_info = [&](
@@ -1040,6 +928,10 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
   // transport="compressed": JPEG-encode BGR/RGB on CPU (~1 ms @ 640×480) and
   // publish sensor_msgs/CompressedImage.  Reduces network bandwidth by ~97%.
   // transport="raw": publish sensor_msgs/Image (raw BGR/RGB, full bandwidth).
+  //
+  // bgr_cache_*: BGR mat at surface resolution cached here so make_nitros_image
+  // can reuse it and skip the second BGRA→BGR NEON pass when both topics active.
+  cv::Mat bgr_cache_left, bgr_cache_right;
   auto publish_visual_side = [&](
     NvBufSurface * bgra_surf,   // null → CPU NV12 fallback
     NvBufSurface * nv12_surf,   // used for CPU fallback only
@@ -1081,6 +973,9 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
       cv::cvtColor(nv12_mat, bgr, cv::COLOR_YUV2BGR_NV12);
     }
 
+    // Cache at surface resolution so make_nitros_image can reuse it
+    (is_left ? bgr_cache_left : bgr_cache_right) = bgr;
+
     // Apply requested encoding (bgr is already the correct base from cvtColor)
     cv::Mat out;
     if (encoding == "rgb8") {
@@ -1116,43 +1011,161 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
   if (vis_enable_right_)
     publish_visual_side(have_raw_surfs ? nvbuf_raw_right_ : nullptr, nvbuf_right_, false);
 
-  // ── NITROS publish (GPU-resident zero-copy) ───────────────────────────────
-  // cuda_nv12_left_/right_ are real cudaMalloc device pointers for downstream
-  // NITROS nodes (e.g. isaac_ros_image_proc, DNN inference pipelines).
-  // Encoding (and topic suffix) are set by cam_{left,right}.nitros_format param.
-
-  auto make_header = [&](const std::string & frame_id) {
-    std_msgs::msg::Header h;
-    h.stamp    = stamp;
-    h.frame_id = frame_id;
-    return h;
-  };
-
-  // NitrosImage carries the requested out_w/out_h dimensions in the header;
-  // downstream NITROS resize node handles further scaling on GPU if needed.
-  auto publish_nitros = [&](
-    void * cuda_ptr,
-    rclcpp::Publisher<NitrosImage>::SharedPtr & pub,
+  // ── NITROS publish via TypeAdapter ────────────────────────────────────────
+  // Publishing sensor_msgs::msg::Image on rclcpp::Publisher<NitrosImage>
+  // triggers convert_to_custom() in the TypeAdapter which creates a
+  // lifecycle-managed GXF VideoBuffer (freed after all subscribers consume it).
+  //
+  // Supported encodings (from params.yaml  left/right_camera.topics.nitros_image.format):
+  //   "rgb8"   — packed RGB8  (step = width*3)   recommended for visualisation
+  //   "bgr8"   — packed BGR8  (step = width*3)   OpenCV-native byte order
+  //   "mono8"  — Y-plane only (step = width)     grayscale
+  //   "nv12"   — Y+UV NV12   (step = width)      NOTE: TypeAdapter single-pass
+  //              cudaMemcpy2D only copies the Y plane; UV plane in the
+  //              GXF VideoBuffer remains uninitialized → downstream sees
+  //              random chroma.  Use "rgb8" for reliable colour output.
+  //
+  // For rgb8/bgr8: VIC already did the heavy NV12→BGRA color matrix in
+  // NvBufSurfTransformAsync.  The CPU step is only BGRA→BGR (single NEON
+  // channel-drop, ~1 cycle/px).  When publish_visual_side already ran for this
+  // side, bgr_cache_{left,right} holds that result at surface resolution so the
+  // NEON pass is skipped entirely here.
+  // cv::resize handles the optional output-resolution downscale.
+  auto make_nitros_image = [&](
+    NvBufSurface * nv12_surf,    // VIC-cropped NV12 surface (eye_width × combined_height)
+    NvBufSurface * bgra_surf,    // VIC-cropped BGRA surface, or nullptr
+    const cv::Mat & bgr_hint,    // optional BGR mat at surf dims from visual path; skips redo
     const std::string & frame_id,
-    const std::string & encoding,
-    int out_w, int out_h)
+    const std::string & enc,
+    int out_w, int out_h) -> sensor_msgs::msg::Image
   {
-    NitrosImage nitros_img = NitrosImageBuilder()
-      .WithHeader(make_header(frame_id))
-      .WithEncoding(encoding)
-      .WithDimensions(static_cast<uint32_t>(out_h),
-                      static_cast<uint32_t>(out_w))
-      .WithGpuData(cuda_ptr)
-      .Build();
-    pub->publish(std::move(nitros_img));
+    sensor_msgs::msg::Image img;
+    img.header.stamp    = stamp;
+    img.header.frame_id = frame_id;
+    img.width           = static_cast<uint32_t>(out_w);
+    img.height          = static_cast<uint32_t>(out_h);
+    img.encoding        = enc;
+    img.is_bigendian    = false;
+
+    if (enc == "rgb8" || enc == "bgr8") {
+      // ── packed 3-channel path ─────────────────────────────────────────────
+      // step = width * 3 so TypeAdapter's cudaMemcpy2D gets
+      //   copy_width = get_step_size = width * 3
+      //   src_pitch  = img.step     = width * 3
+      //   dst_pitch  = GXF stride   = width * 3  (NoPaddingColorPlanes<RGB/BGR>)
+      // All equal → always valid.
+      img.step = static_cast<uint32_t>(out_w) * 3;
+      img.data.resize(static_cast<size_t>(out_w) * static_cast<size_t>(out_h) * 3);
+
+      const int surf_w = eye_width();
+      const int surf_h = combined_height_;
+      cv::Mat bgr;
+
+      if (!bgr_hint.empty()) {
+        // Reuse BGR mat already computed by publish_visual_side — no extra NEON pass
+        bgr = bgr_hint;
+      } else if (bgra_surf) {
+        // BGRA VIC path: BGRA→BGR in one NEON pass, no NV12 de-stride needed
+        const auto & sl = bgra_surf->surfaceList[0];
+        auto * ptr = static_cast<uint8_t *>(sl.mappedAddr.addr[0]);
+        cv::Mat bgra_mat(surf_h, surf_w, CV_8UC4, ptr,
+                         static_cast<size_t>(sl.planeParams.pitch[0]));
+        cv::cvtColor(bgra_mat, bgr, cv::COLOR_BGRA2BGR);
+      } else {
+        // CPU NV12 fallback: de-stride then cvtColor
+        const auto & sl = nv12_surf->surfaceList[0];
+        const auto * y_src  = static_cast<const uint8_t *>(sl.mappedAddr.addr[0]);
+        const auto * uv_src = static_cast<const uint8_t *>(sl.mappedAddr.addr[1]);
+        const size_t py = sl.planeParams.pitch[0];
+        const size_t pu = sl.planeParams.pitch[1];
+        std::vector<uint8_t> nv12_buf(
+          static_cast<size_t>(surf_w) * static_cast<size_t>(surf_h) * 3 / 2);
+        for (int r = 0; r < surf_h; ++r)
+          std::memcpy(nv12_buf.data() + r * surf_w, y_src + r * py, surf_w);
+        for (int r = 0; r < surf_h / 2; ++r)
+          std::memcpy(nv12_buf.data() + surf_w * surf_h + r * surf_w,
+                      uv_src + r * pu, surf_w);
+        cv::Mat nv12_mat(surf_h * 3 / 2, surf_w, CV_8UC1, nv12_buf.data());
+        cv::cvtColor(nv12_mat, bgr, cv::COLOR_YUV2BGR_NV12);
+      }
+
+      // Resize to requested NITROS output resolution if needed
+      if (out_w != bgr.cols || out_h != bgr.rows)
+        cv::resize(bgr, bgr, cv::Size(out_w, out_h));
+
+      // Convert BGR → RGB if needed
+      cv::Mat * out_ptr = &bgr;
+      cv::Mat rgb_tmp;
+      if (enc == "rgb8") {
+        cv::cvtColor(bgr, rgb_tmp, cv::COLOR_BGR2RGB);
+        out_ptr = &rgb_tmp;
+      }
+
+      // step must equal out_w*3 for packed layout (cv::resize output is always packed)
+      std::memcpy(img.data.data(), out_ptr->data,
+                  static_cast<size_t>(out_w) * static_cast<size_t>(out_h) * 3);
+
+    } else if (enc == "mono8") {
+      // ── single-plane luminance path ───────────────────────────────────────
+      img.step = static_cast<uint32_t>(out_w);
+      img.data.resize(static_cast<size_t>(out_w) * static_cast<size_t>(out_h));
+      const auto & sl = nv12_surf->surfaceList[0];
+      const auto * y  = static_cast<const uint8_t *>(sl.mappedAddr.addr[0]);
+      const size_t py = sl.planeParams.pitch[0];
+      for (int r = 0; r < out_h; ++r)
+        std::memcpy(img.data.data() + r * out_w, y + r * py,
+                    static_cast<size_t>(out_w));
+
+    } else {
+      // ── NV12 (and any unrecognised encoding) ──────────────────────────────
+      // TypeAdapter convert_to_custom calls a SINGLE cudaMemcpy2D with
+      //   copy_width = get_step_size = width * bpp_Y = width * 1 = width
+      //   height     = img.height
+      // This copies only the Y plane (width*height bytes).  The UV plane in
+      // the GXF VideoBuffer is never touched and remains uninitialized.
+      // For correctly coloured NITROS output, set format = "rgb8" instead.
+      if (enc != "nv12") {
+        RCLCPP_WARN_ONCE(get_logger(),
+          "make_nitros_image: unrecognised encoding '%s' — treating as nv12.  "
+          "Supported: rgb8, bgr8, mono8, nv12.", enc.c_str());
+      }
+      img.step = static_cast<uint32_t>(out_w);
+      img.data.resize(static_cast<size_t>(out_w) * static_cast<size_t>(out_h) * 3 / 2);
+      uint8_t * dst = img.data.data();
+      const auto & sl = nv12_surf->surfaceList[0];
+      const auto * y   = static_cast<const uint8_t *>(sl.mappedAddr.addr[0]);
+      const auto * uv  = static_cast<const uint8_t *>(sl.mappedAddr.addr[1]);
+      const size_t py  = sl.planeParams.pitch[0];
+      const size_t pu  = sl.planeParams.pitch[1];
+      for (int r = 0; r < out_h; ++r)
+        std::memcpy(dst + r * out_w, y + r * py, static_cast<size_t>(out_w));
+      uint8_t * dst_uv = dst + out_w * out_h;
+      for (int r = 0; r < out_h / 2; ++r)
+        std::memcpy(dst_uv + r * out_w, uv + r * pu, static_cast<size_t>(out_w));
+    }
+    return img;
   };
 
-  if (pub_nitros_left_)
-    publish_nitros(cuda_nv12_left_,  pub_left_nitros_,
-                   frame_id_left_,  nitros_fmt_left_,  eff_out_w_nitros(true),  eff_out_h_nitros(true));
-  if (pub_nitros_right_)
-    publish_nitros(cuda_nv12_right_, pub_right_nitros_,
-                   frame_id_right_, nitros_fmt_right_, eff_out_w_nitros(false), eff_out_h_nitros(false));
+  RCLCPP_INFO_ONCE(get_logger(),
+    "NITROS publish via TypeAdapter  left='%s'  right='%s'  eye=%dx%d",
+    nitros_fmt_left_.c_str(), nitros_fmt_right_.c_str(), ew, combined_height_);
+
+  if (pub_nitros_left_) {
+    auto img = make_nitros_image(
+      nvbuf_left_,  have_raw_surfs ? nvbuf_raw_left_  : nullptr,
+      bgr_cache_left,
+      frame_id_left_,  nitros_fmt_left_,
+      eff_out_w_nitros(true),  eff_out_h_nitros(true));
+    pub_left_nitros_->publish(img);
+  }
+  if (pub_nitros_right_) {
+    auto img = make_nitros_image(
+      nvbuf_right_, have_raw_surfs ? nvbuf_raw_right_ : nullptr,
+      bgr_cache_right,
+      frame_id_right_, nitros_fmt_right_,
+      eff_out_w_nitros(false), eff_out_h_nitros(false));
+    pub_right_nitros_->publish(img);
+  }
 
   return true;
 }

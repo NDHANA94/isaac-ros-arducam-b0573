@@ -24,7 +24,6 @@
   <!-- Isaac ROS NITROS: zero-copy NvBufSurface ↔ ROS image transport (Jetson / HAVE_NVBUF only) -->
   <depend>isaac_ros_nitros</depend>
   <depend>isaac_ros_nitros_image_type</depend>
-  <depend>ament_index_cpp</depend>
 
   <!-- GStreamer / OpenCV are system deps found via pkg-config / cmake; no rosdep entry needed -->
 
