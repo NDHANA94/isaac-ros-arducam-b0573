@@ -22,7 +22,7 @@
 
   --------------------------------------------------------------------------------------------
 
-  * @file dual_camera.cpp
+  * @file arducam-b0573.launch.py
   * @author: WM Nipun Dhananjaya (nipun.dhananjaya@gmail.com)
   * @date: 27.02.2026
   * @brief Launches the ArducamB0573Node.
