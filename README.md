@@ -13,6 +13,16 @@ The node captures a hardware-synchronized side-by-side (SBS) stereo frame from t
 
 ---
 
+</br>
+
+
+> Note: Follow [this link](https://docs.arducam.com/GMSL-Camera-Solution/GMSL-Camera-for-NVIDIA/Quick-Start-Guide/) to set up the B0573 hardware and capture test video with `v4l2-ctl` before running the ROS node. The node expects the camera to be configured for side-by-side (SBS) output on `/dev/video0` by the time it starts.
+
+</br>
+
+![](resources/arducam-b0573.png)
+
+
 ## Hardware
 
 ```
