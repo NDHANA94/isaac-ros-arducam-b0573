@@ -127,7 +127,7 @@ ament_target_dependencies(isaac_ros_arducam_b0573_component ${ROS_DEPS})
 
 # Register the node as a component and generate the standalone executable
 rclcpp_components_register_node(isaac_ros_arducam_b0573_component
-  PLUGIN "isaac_ros::arducam::ArducamB0573Node"
+  PLUGIN "nvidia::isaac_ros::arducam::ArducamB0573Node"
   EXECUTABLE arducam_b0573_node
 )
 

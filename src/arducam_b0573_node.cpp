@@ -50,7 +50,8 @@ using nvidia::isaac_ros::nitros::NitrosImage;
 
 #include <rclcpp_components/register_node_macro.hpp>
 
-
+namespace nvidia
+{
 namespace isaac_ros
 {
 namespace arducam
@@ -1445,5 +1446,6 @@ void ArducamB0573Node::process_sample(GstSample * sample)
 
 }  // namespace arducam
 }  // namespace isaac_ros
+}  // namespace nvidia
 
-RCLCPP_COMPONENTS_REGISTER_NODE(isaac_ros::arducam::ArducamB0573Node)
+RCLCPP_COMPONENTS_REGISTER_NODE(nvidia::isaac_ros::arducam::ArducamB0573Node)

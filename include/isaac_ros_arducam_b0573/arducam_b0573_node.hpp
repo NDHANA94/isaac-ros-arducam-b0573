@@ -64,7 +64,8 @@
 #include "isaac_ros_nitros_image_type/nitros_image.hpp"
 #endif
 
-
+namespace nvidia
+{
 namespace isaac_ros
 {
 namespace arducam
@@ -269,5 +270,6 @@ private:
 
 }  // namespace arducam_dual_camera
 }  // namespace isaac_ros
+}  // namespace nvidia
 
 #endif  // ISAAC_ROS_ARDUCAM_B0573_NODE_HPP_
