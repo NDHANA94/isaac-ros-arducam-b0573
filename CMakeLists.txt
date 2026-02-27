@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(arducam_dual_camera)
+project(isaac_ros_arducam_b0573)
 
 # ── Compiler settings ─────────────────────────────────────────────────────────
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -83,19 +83,19 @@ set(ROS_DEPS
 #   • Loading into a composable container → intra-process zero-copy to
 #     DnnImageEncoderNode, VIO, and any other co-located subscribers.
 #   • rclcpp_components_register_node() auto-generates a standalone wrapper
-#     executable (arducam_dual_cam_node) for use outside a container.
-add_library(arducam_dual_camera_component SHARED
-  src/arducam_dual_cam_node.cpp
+#     executable (arducam_b0573_node) for use outside a container.
+add_library(isaac_ros_arducam_b0573_component SHARED
+  src/arducam_b0573_node.cpp
 )
 
-target_include_directories(arducam_dual_camera_component PUBLIC
+target_include_directories(isaac_ros_arducam_b0573_component PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
   ${GST_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
 )
 
-target_link_libraries(arducam_dual_camera_component
+target_link_libraries(isaac_ros_arducam_b0573_component
   ${GST_LIBRARIES}
   ${OpenCV_LIBS}
 )
@@ -112,27 +112,27 @@ if(HAVE_NVBUF)
     isaac_ros_nitros_image_type
   )
 
-  target_include_directories(arducam_dual_camera_component PRIVATE
+  target_include_directories(isaac_ros_arducam_b0573_component PRIVATE
     ${DS_ROOT}/sources/includes
   )
-  target_link_libraries(arducam_dual_camera_component
+  target_link_libraries(isaac_ros_arducam_b0573_component
     ${DS_ROOT}/lib/libnvbufsurface.so
     ${DS_ROOT}/lib/libnvbufsurftransform.so
     # isaac_ros_nitros_image_type is linked transitively via ament_target_dependencies
   )
-  target_compile_definitions(arducam_dual_camera_component PRIVATE HAVE_NVBUF=1)
+  target_compile_definitions(isaac_ros_arducam_b0573_component PRIVATE HAVE_NVBUF=1)
 endif()
 
-ament_target_dependencies(arducam_dual_camera_component ${ROS_DEPS})
+ament_target_dependencies(isaac_ros_arducam_b0573_component ${ROS_DEPS})
 
 # Register the node as a component and generate the standalone executable
-rclcpp_components_register_node(arducam_dual_camera_component
-  PLUGIN "arducam_dual_camera::ArducamDualCamNode"
-  EXECUTABLE arducam_dual_cam_node
+rclcpp_components_register_node(isaac_ros_arducam_b0573_component
+  PLUGIN "isaac_ros::arducam::ArducamB0573Node"
+  EXECUTABLE arducam_b0573_node
 )
 
 # ── Install ───────────────────────────────────────────────────────────────────
-install(TARGETS arducam_dual_camera_component
+install(TARGETS isaac_ros_arducam_b0573_component
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin

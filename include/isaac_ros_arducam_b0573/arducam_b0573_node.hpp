@@ -1,12 +1,12 @@
 /**
- * @file arducam_dual_cam_node.hpp
+ * @file arducam_b0573_node.hpp
  * @author WM Nipun Dhananjaya (nipun.dhananjaya@gmail.com)
  * @date 26.02.2026 
 */
 
 
-#ifndef ARDUCAM_DUAL_CAMERA__ARDUCAM_DUAL_CAM_NODE_HPP_
-#define ARDUCAM_DUAL_CAMERA__ARDUCAM_DUAL_CAM_NODE_HPP_
+#ifndef ISAAC_ROS_ARDUCAM_B0573_NODE_HPP_
+#define ISAAC_ROS_ARDUCAM_B0573_NODE_HPP_
 
 #pragma once
 
@@ -41,14 +41,17 @@
 #include "isaac_ros_nitros_image_type/nitros_image.hpp"
 #endif
 
-namespace arducam_dual_camera
+
+namespace isaac_ros
+{
+namespace arducam
 {
 
-class ArducamDualCamNode : public rclcpp::Node
+class ArducamB0573Node : public rclcpp::Node
 {
 public:
-  explicit ArducamDualCamNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
-  ~ArducamDualCamNode() override;
+  explicit ArducamB0573Node(const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
+  ~ArducamB0573Node() override;
 
 private:
   // ── Global parameters ─────────────────────────────────────────────────────
@@ -242,6 +245,6 @@ private:
 };
 
 }  // namespace arducam_dual_camera
+}  // namespace isaac_ros
 
-
-#endif  // ARDUCAM_DUAL_CAMERA__ARDUCAM_DUAL_CAM_NODE_HPP_
+#endif  // ISAAC_ROS_ARDUCAM_B0573_NODE_HPP_

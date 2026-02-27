@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>arducam_dual_camera</name>
+  <name>isaac_ros_arducam_b0573</name>
   <version>1.0.0</version>
   <description>
     Hardware-accelerated dual-camera publisher for Arducam B0573 (GMSL2-to-CSI2).

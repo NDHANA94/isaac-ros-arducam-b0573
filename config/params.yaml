@@ -1,4 +1,4 @@
-arducam_dual_cam_node:
+arducam_b0573_node:
   ros__parameters:
     # V4L2 device node
     device: "/dev/video0"
@@ -33,7 +33,7 @@ arducam_dual_cam_node:
           encoding: "bgr8"                # bgr8 | rgb8
           jpeg_quality: 80                # 0-100        (only used when transport=compressed)
           qos:
-            reliability: "best_effort"    # reliable | best_effort
+            reliability: "reliable"    # reliable | best_effort
             durability: "volatile"        # volatile | transient_local
           fps: 30                         # Target frame rate for publishing the visual stream. Actual frame rate may be lower if the camera cannot keep up.    
           resolution:                     # Resolution for the visual stream. If width or height is set to -1, it will use the full capture resolution for that dimension.    

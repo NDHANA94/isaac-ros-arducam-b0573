@@ -6,7 +6,7 @@
 
  */
 
-#include "arducam_dual_camera/arducam_dual_cam_node.hpp"
+#include "isaac_ros_arducam_b0573/arducam_b0573_node.hpp"
 
 #include <opencv2/opencv.hpp>
 #include <cv_bridge/cv_bridge.h>
@@ -27,14 +27,17 @@ using nvidia::isaac_ros::nitros::NitrosImage;
 
 #include <rclcpp_components/register_node_macro.hpp>
 
-namespace arducam_dual_camera
+
+namespace isaac_ros
+{
+namespace arducam
 {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constructor
 // ─────────────────────────────────────────────────────────────────────────────
-ArducamDualCamNode::ArducamDualCamNode(const rclcpp::NodeOptions & options)
-: Node("arducam_dual_cam_node", options)
+ArducamB0573Node::ArducamB0573Node(const rclcpp::NodeOptions & options)
+: Node("arducam_b0573_node", options)
 {
   // ── Global parameters ─────────────────────────────────────────────────────
   declare_parameter("device",        "/dev/video0");
@@ -56,14 +59,14 @@ ArducamDualCamNode::ArducamDualCamNode(const rclcpp::NodeOptions & options)
     declare_parameter(side + ".topics.visual_stream.transport",    std::string("compressed"));
     declare_parameter(side + ".topics.visual_stream.encoding",     std::string("bgr8"));
     declare_parameter(side + ".topics.visual_stream.jpeg_quality", 80);
-    declare_parameter(side + ".topics.visual_stream.qos.reliability", std::string("best_effort"));
+    declare_parameter(side + ".topics.visual_stream.qos.reliability", std::string("reliable"));
     declare_parameter(side + ".topics.visual_stream.qos.durability",  std::string("volatile"));
     declare_parameter(side + ".topics.visual_stream.resolution.width",  -1);
     declare_parameter(side + ".topics.visual_stream.resolution.height", -1);
 
     // ── topics.nitros_image ─────────────────────────────────────────────────
     declare_parameter(side + ".topics.nitros_image.enable",    true);
-    declare_parameter(side + ".topics.nitros_image.qos.reliability", std::string("best_effort"));
+    declare_parameter(side + ".topics.nitros_image.qos.reliability", std::string("reliable"));
     declare_parameter(side + ".topics.nitros_image.qos.durability",  std::string("volatile"));
     // FIX 1.1: default changed from "nv12" to "rgb8" — nv12 via TypeAdapter is broken
     // (TypeAdapter cudaMemcpy2D only copies the Y plane; UV stays uninitialized → green screen)
@@ -262,9 +265,9 @@ ArducamDualCamNode::ArducamDualCamNode(const rclcpp::NodeOptions & options)
   // Supported NitrosImageBuilder encodings: "nv12", "rgb8", "bgr8"
 #ifdef HAVE_NVBUF
   topic_left_nitros_  = get_parameter("left_camera.topics.topic_name_prefix").as_string()
-                        + "/nitros_image_nv12";
+                        + "/nitros_image_" + nitros_fmt_left_;
   topic_right_nitros_ = get_parameter("right_camera.topics.topic_name_prefix").as_string()
-                        + "/nitros_image_nv12";
+                        + "/nitros_image_" + nitros_fmt_right_;
   if (pub_nitros_left_) {
     pub_left_nitros_  = create_publisher<NitrosImage>(
       topic_left_nitros_,  make_qos(qos_nitros_rel_left_,  qos_nitros_dur_left_));
@@ -305,13 +308,13 @@ ArducamDualCamNode::ArducamDualCamNode(const rclcpp::NodeOptions & options)
   build_pipeline();   // also calls init_nvbuf_surfaces() when HAVE_NVBUF
 
   running_        = true;
-  capture_thread_ = std::thread(&ArducamDualCamNode::capture_loop, this);
+  capture_thread_ = std::thread(&ArducamB0573Node::capture_loop, this);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Destructor
 // ─────────────────────────────────────────────────────────────────────────────
-ArducamDualCamNode::~ArducamDualCamNode()
+ArducamB0573Node::~ArducamB0573Node()
 {
   running_ = false;
 
@@ -344,7 +347,7 @@ ArducamDualCamNode::~ArducamDualCamNode()
 //   The header (stamp / frame_id) is intentionally left empty here; it is filled
 //   in at publish time so that each message carries the correct per-frame stamp.
 // ─────────────────────────────────────────────────────────────────────────────
-sensor_msgs::msg::CameraInfo ArducamDualCamNode::build_cam_info(
+sensor_msgs::msg::CameraInfo ArducamB0573Node::build_cam_info(
   const std::string & side, int w, int h)
 {
   const std::string p = side + ".intrinsics";
@@ -398,7 +401,7 @@ sensor_msgs::msg::CameraInfo ArducamDualCamNode::build_cam_info(
 //   transform from the parent frame (extrinsics.relative_to) to child_frame.
 //   rotation is [roll, pitch, yaw] in degrees; translation is [x, y, z] in m.
 // ─────────────────────────────────────────────────────────────────────────────
-void ArducamDualCamNode::broadcast_static_tf(
+void ArducamB0573Node::broadcast_static_tf(
   const std::string & side, const std::string & child_frame)
 {
   const std::string ep = side + ".extrinsics";
@@ -449,7 +452,7 @@ void ArducamDualCamNode::broadcast_static_tf(
 // compiled in, NvBufSurfTransform performs the NV12→BGR conversion + crop via
 // VIC, so the CPU never sees the combined-format frame at all.
 // ─────────────────────────────────────────────────────────────────────────────
-bool ArducamDualCamNode::try_build_pipeline(bool nvmm, const std::string & out_fmt)
+bool ArducamB0573Node::try_build_pipeline(bool nvmm, const std::string & out_fmt)
 {
   // v4l2src always outputs system-memory buffers (the tegra-video V4L2 driver
   // does not support memory:NVMM on the source pad for UYVY).
@@ -534,7 +537,7 @@ bool ArducamDualCamNode::try_build_pipeline(bool nvmm, const std::string & out_f
 //   gst_buffer_map() on an NVMM appsink returns NvBufSurface* (not pixel data).
 //   Without NvBufSurface the CPU path cannot interpret that pointer.
 // ─────────────────────────────────────────────────────────────────────────────
-void ArducamDualCamNode::build_pipeline()
+void ArducamB0573Node::build_pipeline()
 {
   bool ok = false;
 
@@ -622,7 +625,7 @@ void ArducamDualCamNode::build_pipeline()
 //   • NvBufSurfaceMap(planeIdx=-1, READ_WRITE) maps BOTH Y (addr[0]) and UV
 //     (addr[1]) planes.  planeIdx=0 leaves addr[1] null; std::memcpy from null
 //     in nv12_to_bgr_mat() would SIGSEGV immediately on the UV copy.
-void ArducamDualCamNode::init_nvbuf_surfaces()
+void ArducamB0573Node::init_nvbuf_surfaces()
 {
   NvBufSurfaceCreateParams params;
   memset(&params, 0, sizeof(params));
@@ -745,7 +748,7 @@ void ArducamDualCamNode::init_nvbuf_surfaces()
 }
 
 // ── cleanup_nvbuf_surfaces() ──────────────────────────────────────────────────
-void ArducamDualCamNode::cleanup_nvbuf_surfaces()
+void ArducamB0573Node::cleanup_nvbuf_surfaces()
 {
   if (nvbuf_left_) {
     NvBufSurfaceUnMap(nvbuf_left_,  0, -1);
@@ -785,7 +788,7 @@ void ArducamDualCamNode::cleanup_nvbuf_surfaces()
 //     creates a lifecycle-managed GXF VideoBuffer; freed after consumption.
 //
 // Returns false if any VIC operation fails; caller rebuilds to CPU pipeline.
-bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Time & stamp)
+bool ArducamB0573Node::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Time & stamp)
 {
   GstMapInfo map{};
   // NVMM gst_buffer_map returns the 64-byte NvBufSurface* struct — O(1).
@@ -1217,7 +1220,7 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
 // ─────────────────────────────────────────────────────────────────────────────
 // capture_loop()  — runs in a dedicated thread
 // ─────────────────────────────────────────────────────────────────────────────
-void ArducamDualCamNode::capture_loop()
+void ArducamB0573Node::capture_loop()
 {
   RCLCPP_INFO(get_logger(), "Capture thread started");
 
@@ -1239,7 +1242,7 @@ void ArducamDualCamNode::capture_loop()
 // ─────────────────────────────────────────────────────────────────────────────
 // process_sample()
 // ─────────────────────────────────────────────────────────────────────────────
-void ArducamDualCamNode::process_sample(GstSample * sample)
+void ArducamB0573Node::process_sample(GstSample * sample)
 {
   GstBuffer * buf = gst_sample_get_buffer(sample);
   if (!buf) return;
@@ -1417,6 +1420,7 @@ void ArducamDualCamNode::process_sample(GstSample * sample)
   if (vis_enable_right_) publish_cpu_visual(right_bgr, false);
 }
 
-}  // namespace arducam_dual_camera
+}  // namespace arducam
+}  // namespace isaac_ros
 
-RCLCPP_COMPONENTS_REGISTER_NODE(arducam_dual_camera::ArducamDualCamNode)
+RCLCPP_COMPONENTS_REGISTER_NODE(isaac_ros::arducam::ArducamB0573Node)

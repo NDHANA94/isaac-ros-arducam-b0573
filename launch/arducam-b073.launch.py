@@ -1,7 +1,7 @@
 """
 dual_camera.launch.py
 
-Launches the ArducamDualCamNode.
+Launches the ArducamB0573Node.
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
@@ -18,13 +18,13 @@ def _make_node(context, *args, **kwargs):
     when explicitly set by the user (non-empty).  When they are empty (default),
     the values from config/params.yaml are used unchanged.
     """
-    pkg = FindPackageShare("arducam_dual_camera").perform(context)
+    pkg = FindPackageShare("isaac_ros_arducam_b0573").perform(context)
     params_yaml = os.path.join(pkg, "config", "params.yaml")
 
     node = Node(
-        package="arducam_dual_camera",
-        executable="arducam_dual_cam_node",
-        name="arducam_dual_cam_node",
+        package="isaac_ros_arducam_b0573",
+        executable="arducam_b0573_node",
+        name="arducam_b0573_node",
         output="screen",
         parameters=[
             params_yaml
