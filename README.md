@@ -2,13 +2,13 @@
 
 A high-performance ROS 2 Humble composable node for the **Arducam B0573** — a 2.3 MP Global Shutter Dual-Camera kit (GMSL2-to-CSI2) — running on NVIDIA Jetson Orin Nano.
 
-The node captures a hardware-synchronized side-by-side (SBS) stereo frame from the CSI-2 port, splits it into independent left and right streams, and publishes them over three configurable topic channels per camera:
+The node captures a hardware-synchronized side-by-side (SBS) stereo frame from the CSI-2 port, splits it into independent left and right streams, and publishes them over configurable topic channels per camera:
 
 | Channel | Topic (default) | Message type | Notes |
 |---|---|---|---|
 | `visual_stream` | `…/image/compressed` | `sensor_msgs/CompressedImage` | JPEG, network-friendly (default) |
 | `visual_stream` | `…/image_raw` | `sensor_msgs/Image` | raw BGR/RGB (set `transport: raw`) |
-| `nitros_image` | `…/nitros_image_nv12` | `NitrosImage` (NV12) | GPU-resident zero-copy, HAVE_NVBUF only |
+| `nitros_image` | `…/nitros_image_nv12` | `NitrosImage` | GPU-resident zero-copy, HAVE_NVBUF only |
 | `camera_info` | `…/camera_info` | `sensor_msgs/CameraInfo` | calibration, always published |
 
 ---
@@ -30,257 +30,213 @@ The node captures a hardware-synchronized side-by-side (SBS) stereo frame from t
 
 ---
 
-## Pipeline & Data Flow
+## Build
 
-### Capture pipeline (GStreamer)
-
-Three pipeline variants are tried on startup in order of preference:
-
-```
-1. v4l2src(UYVY) → nvvidconv/VIC → NV12(NVMM)  → appsink  [preferred — 1.5 B/px]
-2. v4l2src(UYVY) → nvvidconv/VIC → BGRx(NVMM)  → appsink  [NVMM fallback — 4 B/px]
-3. v4l2src(UYVY) → nvvidconv/VIC → BGRx         → appsink  [system-memory CPU path]
+```bash
+# inside your ROS 2 workspace root
+colcon build --packages-select arducam_dual_camera \
+             --cmake-args -DCMAKE_BUILD_TYPE=Release
+source install/setup.bash
 ```
 
-`nvvidconv` always runs on the **VIC** (Video Image Compositor) hardware engine, so the UYVY→NV12 colour-space conversion is zero-CPU regardless of which variant is active.
-
-### Per-frame processing (HAVE_NVBUF path — preferred)
-
-```
-gst_buffer_map(NVMM)                  ← O(1), returns NvBufSurface* pointer only
-       │
-       ├── NvBufSurfTransformAsync ×2  ← VIC: NV12 crop → nvbuf_left_  / nvbuf_right_
-       │                                  (SURFACE_ARRAY dst, required by VIC on Orin)
-       ├── NvBufSurfTransformAsync ×2  ← VIC: NV12→BGRA crop → nvbuf_raw_left_ / _right_
-       │                                  (all 4 VIC jobs dispatched concurrently)
-       │
-       ├── SyncObjWait ×4             ← wait for all VIC jobs; gst_buffer_unmap
-       │
-       ├── NvBufSurfaceSyncForCpu ×2  ← make CPU view coherent (NV12 SURFACE_ARRAY)
-       │
-       ├── cudaMemcpy2D ×2 (Y + UV)   ← stride-remove NV12 into cudaMalloc buffers
-       │                                  (on Jetson iGPU this is coherence bookkeeping,
-       │                                   not a real DMA copy — same LPDDR5 pages)
-       │
-       ├── NitrosImageBuilder::Build() ← wraps cuda_nv12_* in GXF VideoBuffer
-       │   pub_{left,right}_nitros_   ← zero-copy GPU handle to downstream NITROS nodes
-       │
-       └── publish_visual_side ×2      ← BGRA→BGR (NEON), then:
-               transport=compressed  → cv::imencode(".jpg") → CompressedImage
-               transport=raw         → cv_bridge::CvImage  → Image
-```
-
-### Per-frame processing (CPU fallback path)
-
-```
-gst_buffer_map(system-memory)
-       │
-       ├── cv::Mat ROI split           ← left = combined[:, 0:ew],  right = combined[:, ew:]
-       │
-       ├── cv::cvtColor ×2             ← BGRx→BGR8 (NEON auto-vectorised at -O3)
-       │
-       └── publish_cpu_visual ×2       ← encoding conversion, optional resize, then:
-               transport=compressed  → cv::imencode(".jpg") → CompressedImage
-               transport=raw         → cv_bridge::CvImage  → Image
-```
-
-### Bandwidth comparison (1280×480 @ 30 fps, per eye)
-
-| Stream | Bandwidth | Notes |
-|---|---|---|
-| NV12 NITROS | ~4.7 MB/s | GPU-resident, zero host copy |
-| visual_stream (compressed, q=80) | ~0.5–1 MB/s | JPEG ~97% reduction vs raw |
-| visual_stream (raw BGR) | ~27 MB/s | Full uncompressed, WiFi-hostile |
+Requires JetPack 6.2+, DeepStream 7.1+, Isaac ROS NITROS, and `libnvbufutils-dev`.  
+When `libnvbufutils` is absent the node still builds and runs via the CPU fallback path.
 
 ---
 
-## Published Topics
+## Launch
 
-All topic names are derived from `<prefix>/<suffix>` where the prefix is set by `topics.topic_name_prefix` in `params.yaml` (default: `/arducam/left` and `/arducam/right`).
+```bash
+ros2 launch arducam_dual_camera dual_camera.launch.py
+```
 
-| Topic | Type | Condition |
-|---|---|---|
-| `<prefix>/image/compressed` | `sensor_msgs/CompressedImage` | `visual_stream.enable=true` and `transport=compressed` |
-| `<prefix>/image_raw` | `sensor_msgs/Image` | `visual_stream.enable=true` and `transport=raw` |
-| `<prefix>/camera_info` | `sensor_msgs/CameraInfo` | always |
-| `<prefix>/nitros_image_nv12` | `NitrosImage` | `nitros_image.enable=true`, `HAVE_NVBUF` compiled |
+To override parameters at launch time:
+
+```bash
+ros2 launch arducam_dual_camera dual_camera.launch.py \
+  width:=2560 height:=720 fps:=30
+```
 
 ---
 
-## TF Frames
+## Pipeline Architecture
 
-One static transform is broadcast per camera at startup:
+### Data-flow overview
 
-```
-<extrinsics.relative_to>  ──►  <frame_id>
-     (e.g. base_link)               (e.g. left_camera)
-```
+![](resources/pipeline-dataflow.png)
 
-Rotation is specified as `[roll, pitch, yaw]` in degrees; translation as `[x, y, z]` in metres.
+
+### GStreamer pipeline tiers
+
+The node calls `try_build_pipeline()` up to three times, trying progressively simpler configurations until one succeeds.
+
+| Tier | Memory | Format | VIC used | CPU copy |
+|------|--------|--------|----------|----------|
+| **1** | `NVMM` | NV12 | Yes — UYVY→NV12 + crop per eye | None — `NvBufSurface*` zero-copy |
+| **2** | `NVMM` | BGRx | Yes — UYVY→BGRx + crop per eye | None — `NvBufSurface*` zero-copy |
+| **3** | System RAM | BGRx | Yes — UYVY→BGRx via nvvidconv | Full frame DMA by V4L2 driver |
+
+### NVBUF hardware path detail
+
+When Tier 1 or 2 is active, each captured frame stays in NVMM device memory from the sensor to the publishers with minimal CPU involvement:
+
+1. `gst_buffer_map(NVMM)` → `NvBufSurface*` pointer — O(1), no pixel copy.
+2. Four `NvBufSurfTransformAsync` calls are submitted concurrently to the VIC:
+   - NV12 crop → left eye surface (NITROS path)
+   - NV12 crop → right eye surface (NITROS path)
+   - BGRA crop → left eye surface (visual_stream path)
+   - BGRA crop → right eye surface (visual_stream path)
+3. All four VIC sync objects are waited. `gst_buffer_unmap`.
+4. `NvBufSurfaceSyncForCpu` flushes CPU cache coherency on all four surfaces.
+5. `make_nitros_image` stride-strips the NV12 surface into a preallocated `sensor_msgs::msg::Image` and publishes via TypeAdapter — the TypeAdapter creates a GXF VideoBuffer freed automatically after consumption.
+6. JPEG visual_stream encoding is dispatched to `std::async` so the VIC is not stalled by the ~3–8 ms JPEG encode time.
+
+### Bandwidth comparison at 2560×720 @ 30 fps
+
+| Path | Data per frame | Bandwidth |
+|------|---------------|-----------|
+| NV12 NITROS TypeAdapter | 2.77 MB | ~83 MB/s |
+| BGRx CPU full-frame copy | 7.37 MB | ~221 MB/s |
+
+---
+
+## Topics
+
+All topics are published under the prefix configured by `topics.topic_name_prefix` (defaults `/arducam/left` and `/arducam/right`).
+
+### Left camera
+
+| Topic | Type | Published when |
+|---|---|---|
+| `/arducam/left/image_raw` | `sensor_msgs/Image` | `visual_stream.enable: true` and `transport: raw` |
+| `/arducam/left/image/compressed` | `sensor_msgs/CompressedImage` | `visual_stream.enable: true` and `transport: compressed` |
+| `/arducam/left/nitros_image_nv12` | `NitrosImage` | `nitros_image.enable: true` and `HAVE_NVBUF` compiled |
+| `/arducam/left/camera_info` | `sensor_msgs/CameraInfo` | always |
+
+### Right camera
+
+| Topic | Type | Published when |
+|---|---|---|
+| `/arducam/right/image_raw` | `sensor_msgs/Image` | `visual_stream.enable: true` and `transport: raw` |
+| `/arducam/right/image/compressed` | `sensor_msgs/CompressedImage` | `visual_stream.enable: true` and `transport: compressed` |
+| `/arducam/right/nitros_image_nv12` | `NitrosImage` | `nitros_image.enable: true` and `HAVE_NVBUF` compiled |
+| `/arducam/right/camera_info` | `sensor_msgs/CameraInfo` | always |
+
+### TF
+
+| Frame | Parent | Source |
+|---|---|---|
+| `left_camera` | `base_link` | `extrinsics.relative_to` + static TF broadcast |
+| `right_camera` | `base_link` | `extrinsics.relative_to` + static TF broadcast |
 
 ---
 
 ## Parameters
 
-All parameters live under `arducam_dual_cam_node/ros__parameters` in `config/params.yaml`.
+All parameters live under the node name `arducam_dual_cam_node`. The `{side}` placeholder stands for either `left_camera` or `right_camera`.
 
 ### Global
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `device` | string | `/dev/video0` | V4L2 device node |
-| `width` | int | `1280` | Combined side-by-side width (pixels) |
-| `height` | int | `480` | Combined height (pixels) |
-| `fps` | int | `30` | Capture frame rate (0 = driver-negotiated) |
-| `pixel_format` | string | `UYVY` | V4L2 input format (`UYVY` or `NV16`) |
+| `device` | `string` | `/dev/video0` | V4L2 device node for the SBS camera |
+| `width` | `int` | `2560` | Combined SBS frame width in pixels |
+| `height` | `int` | `720` | Combined SBS frame height in pixels |
+| `fps` | `int` | `30` | Requested capture frame rate |
+| `pixel_format` | `string` | `UYVY` | V4L2 pixel format reported by `v4l2-ctl` — `UYVY` or `NV16` |
 
-Available capture modes for the B0573:
+Available SBS resolutions for the B0573:
 
-| Combined resolution | Per-eye resolution |
-|---|---|
-| 3840 × 1200 | 1920 × 1200 |
-| 2560 × 720 | 1280 × 720 |
-| **1280 × 480** | **640 × 480** (default) |
-
-### Per-camera (`left_camera.*` / `right_camera.*`)
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `frame_id` | string | `left_camera` / `right_camera` | TF frame ID stamped on all messages |
-| `topics.topic_name_prefix` | string | `/arducam/left` / `/arducam/right` | Prefix for all derived topic names |
-
-#### `topics.visual_stream`
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `enable` | bool | `true` | Publish this stream |
-| `transport` | string | `compressed` | `compressed` = JPEG `sensor_msgs/CompressedImage`; `raw` = `sensor_msgs/Image` |
-| `encoding` | string | `bgr8` | Pixel encoding: `bgr8` or `rgb8` |
-| `jpeg_quality` | int | `80` | JPEG quality 0–100 (only used when `transport=compressed`) |
-| `qos.reliability` | string | `best_effort` | `reliable` or `best_effort` |
-| `qos.durability` | string | `volatile` | `volatile` or `transient_local` |
-| `resolution.width` | int | `-1` | Output width (-1 = same as capture) |
-| `resolution.height` | int | `-1` | Output height (-1 = same as capture) |
-
-#### `topics.nitros_image`
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `enable` | bool | `true` | Publish GPU-resident NitrosImage (requires `HAVE_NVBUF`) |
-| `format` | string | `nv12` | `nv12`, `nv24`, `rgb8`, or `bgr8` |
-| `qos.reliability` | string | `best_effort` | `reliable` or `best_effort` |
-| `qos.durability` | string | `volatile` | `volatile` or `transient_local` |
-| `resolution.width` | int | `-1` | Output width (-1 = same as capture) |
-| `resolution.height` | int | `-1` | Output height (-1 = same as capture) |
-
-#### `topics.camera_info`
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `qos.reliability` | string | `reliable` | `reliable` or `best_effort` |
-| `qos.durability` | string | `volatile` | `volatile` or `transient_local` |
-
-#### `extrinsics`
-
-| Parameter | Type | Description |
+| `width` | `height` | Per-eye resolution |
 |---|---|---|
-| `relative_to` | string | Parent TF frame (e.g. `base_link`) |
-| `rotation` | double[3] | `[roll, pitch, yaw]` in degrees |
-| `translation` | double[3] | `[x, y, z]` in metres |
-
-#### `intrinsics`
-
-| Parameter | Type | Description |
-|---|---|---|
-| `fx`, `fy`, `cx`, `cy` | double | Focal lengths and principal point (pixels) |
-| `distortion_model` | string | `plumb_bob`, `rational_polynomial`, or `thin_prism_fisheye` |
-| `distortion_coefficients` | double[] | D vector (5 or more coefficients) |
-| `reflection_matrix.data` | double[9] | Rectification matrix R (row-major) |
-| `projection_matrix.data` | double[12] | Projection matrix P (row-major, 3×4) |
+| `3840` | `1200` | 1920 × 1200 |
+| `2560` | `720` | 1280 × 720 |
+| `1280` | `480` | 640 × 480 |
 
 ---
 
-## Quick Start
+### Per-camera — identity
 
-```bash
-# Build
-cd ~/ros2_ws
-colcon build --packages-select arducam_dual_camera \
-             --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
-
-# Launch
-source install/setup.bash
-ros2 launch arducam_dual_camera dual_camera.launch.py
-
-# Verify topics
-ros2 topic list | grep arducam
-ros2 topic hz /arducam/left/image/compressed
-```
-
-### View compressed stream in rviz2 (remote machine)
-
-```bash
-# Install the compressed image transport plugin if not present
-sudo apt install ros-humble-image-transport-plugins
-
-# In rviz2 → Add → By topic → /arducam/left/image/compressed → Image
-```
-
-### Switch to raw transport (local display, no compression)
-
-Edit `config/params.yaml`:
-```yaml
-left_camera:
-  topics:
-    visual_stream:
-      transport: "raw"
-```
-Then rebuild and relaunch.
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `{side}.frame_id` | `string` | `left_camera` / `right_camera` | TF frame ID embedded in every published message header |
+| `{side}.topics.topic_name_prefix` | `string` | `/arducam/left` / `/arducam/right` | Prefix for all topic names on this side |
 
 ---
 
-## Dependencies
+### Per-camera — `visual_stream`
 
-| Dependency | Required | Notes |
-|---|---|---|
-| ROS 2 Humble | Yes | |
-| OpenCV 4 | Yes | `cv_bridge` |
-| GStreamer 1.x | Yes | `gst-plugins-good`, `gst-plugins-bad` |
-| NVIDIA JetPack 6.2+ | For HAVE_NVBUF | `nvbufsurface`, `nvbufsurftransform` |
-| Isaac ROS NITROS | For HAVE_NVBUF | `isaac_ros_nitros`, `isaac_ros_nitros_image_type` |
-| `tf2_ros` | Yes | static TF broadcaster |
+The visual stream publishes human-viewable images, either as raw pixels or JPEG-compressed.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `{side}.topics.visual_stream.enable` | `bool` | `true` | Whether to publish the visual stream |
+| `{side}.topics.visual_stream.transport` | `string` | `compressed` | `compressed` → `sensor_msgs/CompressedImage` JPEG &nbsp;·&nbsp; `raw` → `sensor_msgs/Image` |
+| `{side}.topics.visual_stream.encoding` | `string` | `bgr8` | Pixel encoding: `bgr8` or `rgb8` |
+| `{side}.topics.visual_stream.jpeg_quality` | `int` | `80` | JPEG quality 0–100 (only when `transport: compressed`) |
+| `{side}.topics.visual_stream.qos.reliability` | `string` | `best_effort` | QoS reliability: `reliable` or `best_effort` |
+| `{side}.topics.visual_stream.qos.durability` | `string` | `volatile` | QoS durability: `volatile` or `transient_local` |
+| `{side}.topics.visual_stream.fps` | `int` | `30` | Target publish rate (actual rate limited by capture) |
+| `{side}.topics.visual_stream.resolution.width` | `int` | `-1` | Output width in pixels — `-1` = same as capture |
+| `{side}.topics.visual_stream.resolution.height` | `int` | `-1` | Output height in pixels — `-1` = same as capture |
 
 ---
 
-## Package Layout
+### Per-camera — `nitros_image`
 
-```
-arducam_dual_camera/
-├── config/
-│   ├── params.yaml                 # all node parameters
-│   └── nitros_context_graph.yaml   # minimal GXF graph for NitrosContext init
-├── include/arducam_dual_camera/
-│   └── arducam_dual_cam_node.hpp
-├── launch/
-│   ├── dual_camera.launch.py       # main launch file
-│   └── list_modes.launch.py        # helper: list V4L2 camera modes
-├── scripts/
-│   └── list_camera_modes.py
-└── src/
-    ├── arducam_dual_cam_node.cpp
-    └── main.cpp
-```
+The NITROS stream delivers GPU-resident frames to downstream Isaac ROS nodes via zero-copy TypeAdapter without a full CPU round-trip.
 
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `{side}.topics.nitros_image.enable` | `bool` | `true` | Whether to publish NITROS frames (requires `HAVE_NVBUF`) |
+| `{side}.topics.nitros_image.format` | `string` | `rgb8` | Pixel format: `rgb8` or `bgr8` — `nv12` is not recommended (TypeAdapter UV-plane limitation) |
+| `{side}.topics.nitros_image.qos.reliability` | `string` | `reliable` | QoS reliability: `reliable` or `best_effort` |
+| `{side}.topics.nitros_image.qos.durability` | `string` | `volatile` | QoS durability: `volatile` or `transient_local` |
+| `{side}.topics.nitros_image.fps` | `int` | `30` | Target publish rate |
+| `{side}.topics.nitros_image.resolution.width` | `int` | `-1` | Output width — `-1` = same as capture |
+| `{side}.topics.nitros_image.resolution.height` | `int` | `-1` | Output height — `-1` = same as capture |
 
+> **Note on `format: nv12`:** The Isaac ROS NITROS TypeAdapter's `convert_to_custom()` issues a single `cudaMemcpy2D` sized for the Y plane only. The UV plane in the resulting GXF `VideoBuffer` is never populated, producing a green-tinted image downstream. Use `rgb8` or `bgr8` instead.
 
+---
 
+### Per-camera — `camera_info`
 
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `{side}.topics.camera_info.qos.reliability` | `string` | `reliable` | QoS reliability |
+| `{side}.topics.camera_info.qos.durability` | `string` | `volatile` | QoS durability |
+| `{side}.topics.camera_info.fps` | `int` | `30` | Target publish rate |
 
+---
 
+### Per-camera — `extrinsics`
 
+Rigid-body transform from `extrinsics.relative_to` to the camera optical frame. Broadcast once as a static TF at startup.
 
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `{side}.extrinsics.relative_to` | `string` | `base_link` | Parent TF frame for the static transform |
+| `{side}.extrinsics.rotation` | `double[3]` | `[0, 0, 0]` | Roll, pitch, yaw in **degrees** |
+| `{side}.extrinsics.translation` | `double[3]` | `[0, 0, 0]` | X, Y, Z offset in **metres** |
 
-## TODO:
+---
 
-- [ ] nitros `rgb8` and `bgr8` format support (currently only `nv12` and `nv24` is supported for nitros output)
-- [ ] Add launch file with dynamic reconfigure support for parameters
+### Per-camera — `intrinsics`
+
+Used to populate `sensor_msgs/CameraInfo` on every published frame.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `{side}.intrinsics.fx` | `double` | `900.0` | Focal length x in pixels |
+| `{side}.intrinsics.fy` | `double` | `900.0` | Focal length y in pixels |
+| `{side}.intrinsics.cx` | `double` | `640.0` | Principal point x |
+| `{side}.intrinsics.cy` | `double` | `360.0` | Principal point y |
+| `{side}.intrinsics.distortion_model` | `string` | `plumb_bob` | `plumb_bob` · `rational_polynomial` · `thin_prism_fisheye` |
+| `{side}.intrinsics.distortion_coefficients` | `double[5]` | `[0…]` | D vector for the chosen distortion model |
+| `{side}.intrinsics.reflection_matrix.data` | `double[9]` | `I₃` | Rectification matrix R — row-major 3×3 |
+| `{side}.intrinsics.projection_matrix.data` | `double[12]` | `[P·I\|0]` | Projection matrix P — row-major 3×4 — Tx = -fx·baseline for the right camera |
+
+> **Placeholder values** — replace `fx`, `fy`, `cx`, `cy`, and the distortion coefficients with the results of a proper stereo calibration run before deploying.
+
+---

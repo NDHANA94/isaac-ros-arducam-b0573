@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <ctime>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -102,8 +103,13 @@ private:
   int         vis_jpeg_quality_left_{80};
   int         vis_jpeg_quality_right_{80};
 
-  // Static TF broadcaster (publishes extrinsics: relative_to → camera frame_id)
+  // static TF broadcaster
   std::shared_ptr<tf2_ros::StaticTransformBroadcaster> tf_static_broadcaster_;
+
+  // FIX 3.3: JPEG encode futures — encode runs off the capture thread so VIC
+  // isn't stalled by libjpeg (3–8 ms @ 640×480). Shared by NVBUF and CPU paths.
+  std::future<void> jpeg_future_left_;
+  std::future<void> jpeg_future_right_;
 
   // ── GStreamer ─────────────────────────────────────────────────────────────
   // Preferred pipeline (NVMM→NV12):
@@ -206,6 +212,10 @@ private:
 
   bool           use_nvbuf_{false};       // true once surfaces allocated successfully
 
+  // FIX 3.2: persistent VIC session — required for NvBufSurfTransformAsync to
+  // actually submit work (without it the call silently does nothing on Orin).
+  NvBufSurfTransformConfigParams vic_session_{};
+
   // NV12 SURFACE_ARRAY VIC dst — used for NITROS publish path.
   NvBufSurface * nvbuf_left_{nullptr};
   NvBufSurface * nvbuf_right_{nullptr};
@@ -213,6 +223,13 @@ private:
   // BGRA SURFACE_ARRAY VIC dst — used for image_raw (rviz2) publish path.
   NvBufSurface * nvbuf_raw_left_{nullptr};
   NvBufSurface * nvbuf_raw_right_{nullptr};
+
+  // FIX 2.2: Pre-allocated staging images — reused every frame to avoid 120×/s malloc.
+  sensor_msgs::msg::Image nitros_img_left_;
+  sensor_msgs::msg::Image nitros_img_right_;
+
+  // FIX 2.3: Shared NV12 CPU de-stride buffer — sized eye_w × combined_h × 3/2.
+  std::vector<uint8_t> nv12_cpu_staging_;
 
   // Allocate NV12 CUDA-device NvBufSurfaces per eye; set use_nvbuf_ = true.
   void init_nvbuf_surfaces();

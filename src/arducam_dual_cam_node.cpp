@@ -3,89 +3,7 @@
  *
  * Single ROS 2 composable node for the Arducam B0573 (GMSL2-to-CSI2) dual camera.
  *
- * ═══════════════════════════════════════════════════
- * Hardware acceleration — Jetson Orin Nano (JetPack 6)
- * ═══════════════════════════════════════════════════
- *
- * VIC (Video Image Compositor) — always used
- *   nvvidconv GStreamer element drives the VIC for all colour-space conversions
- *   (UYVY→NV12 preferred; UYVY→BGRx as fallback).
- *
- * NvBufSurface / NvBufSurfTransform  (HAVE_NVBUF path, preferred)
- *   When the pipeline negotiates memory:NVMM caps, gst_buffer_map() returns
- *   an NvBufSurface* — no pixel data is copied to CPU.  Two async VIC
- *   NvBufSurfTransformAsync() calls then crop the combined frame into left/right
- *   NV12 per-eye NvBufSurfaces entirely in VIC hardware.
- *
- * Isaac ROS NITROS  (HAVE_NVBUF path)
- *   Publishing sensor_msgs::msg::Image on rclcpp::Publisher<NitrosImage> triggers
- *   the TypeAdapter's convert_to_custom(), which copies the NV12 data from the
- *   CPU-mapped NvBufSurface into a lifecycle-managed GXF VideoBuffer and delivers
- *   it to downstream NITROS nodes.
- *
- *   Pipeline bandwidth comparison at 2560×720 @ 30 fps:
- *     NV12 NITROS:  2.77 MB/frame = 83 MB/s  (TypeAdapter path)    ← preferred
- *     BGRx CPU:     7.37 MB/frame = 221 MB/s on LPDDR5              ← fallback
- *
- *   NITROS path CPU cost:
- *     NvBufSurfTransform() housekeeping (µs)
- *     std::memcpy stride-strip NV12 into sensor_msgs::msg::Image (µs)
- *     TypeAdapter convert_to_custom() GXF VideoBuffer alloc (µs)
- *     ZERO NitrosImageBuilder / GXF entity pool allocation
- *
- * CPU fallback (HAVE_NVBUF not defined, or NVMM not negotiated)
- *   v4l2src BGRx + gst_buffer_map copy to CPU + cv::cvtColor × 2.
- *   Compiler is built with -O3 -march=armv8.2-a+simd+fp16+dotprod so NEON
- *   is auto-vectorised for the colour-conversion kernels.
- *
- * NVDEC — not applicable (raw sensor frames are uncompressed).
- *
- * ═══════════════════════════════
- * Pipeline fallback order
- * ═══════════════════════════════
- *   1. v4l2src(NVMM,UYVY) → nvvidconv/VIC → NV12(NVMM)  → appsink  [preferred]
- *   2. v4l2src(NVMM,UYVY) → nvvidconv/VIC → BGRx(NVMM)  → appsink
- *   3. v4l2src(UYVY)      → nvvidconv/VIC → BGRx         → appsink  [CPU path]
- *
- * Topics published (matches isaac_ros_argus_camera stereo pattern):
- *   /arducam/left/image/compressed       sensor_msgs/CompressedImage  BGR jpeg (default, rviz2 net)
- *   /arducam/right/image/compressed      sensor_msgs/CompressedImage  BGR jpeg (default, rviz2 net)
- *   /arducam/left/image_raw              sensor_msgs/Image   bgr8, when transport=raw
- *   /arducam/right/image_raw             sensor_msgs/Image   bgr8, when transport=raw
- *   /arducam/left/camera_info            sensor_msgs/CameraInfo, always
- *   /arducam/right/camera_info           sensor_msgs/CameraInfo, always
- *   /arducam/left/nitros_image_nv12      NitrosImage  NV12 GPU-resident, HAVE_NVBUF only
- *   /arducam/right/nitros_image_nv12     NitrosImage  NV12 GPU-resident, HAVE_NVBUF only
- *
- * Parameters:
- *   device              (string)  /dev/video0
- *   width               (int)     2560
- *   height              (int)     720
- *   fps                 (int)     30
- *   pixel_format        (string)  UYVY
- *
- *   left_camera / right_camera  (nested, mirrors params.yaml structure)
- *     .frame_id                               string   left_camera / right_camera
- *     .topics.topic_name_prefix               string   /arducam/{left,right}
- *     .topics.visual_stream.enable            bool     true
- *     .topics.visual_stream.transport         string   compressed | raw
- *     .topics.visual_stream.encoding          string   bgr8 | rgb8
- *     .topics.visual_stream.jpeg_quality      int      80 (only when transport=compressed)
- *     .topics.visual_stream.qos.{reliability,durability}  string
- *     .topics.visual_stream.resolution.{width,height} int  -1 = same as capture
- *     .topics.nitros_image.enable             bool     true
- *     .topics.nitros_image.qos.{reliability,durability}  string
- *     .topics.nitros_image.format             string   nv12 | rgb8 | bgr8
- *     .topics.nitros_image.resolution.{width,height} int  -1 = same as capture
- *     .topics.camera_info.qos.{reliability,durability}  string
- *     .extrinsics.relative_to          string   base_link
- *     .extrinsics.rotation             double[] [roll, pitch, yaw] deg
- *     .extrinsics.translation          double[] [x, y, z] m
- *     .intrinsics.fx / fy / cx / cy    double
- *     .intrinsics.distortion_model     string   plumb_bob
- *     .intrinsics.distortion_coefficients double[]
- *     .intrinsics.reflection_matrix.data  double[9]   rectification R
- *     .intrinsics.projection_matrix.data  double[12]  projection P
+
  */
 
 #include "arducam_dual_camera/arducam_dual_cam_node.hpp"
@@ -147,7 +65,9 @@ ArducamDualCamNode::ArducamDualCamNode(const rclcpp::NodeOptions & options)
     declare_parameter(side + ".topics.nitros_image.enable",    true);
     declare_parameter(side + ".topics.nitros_image.qos.reliability", std::string("best_effort"));
     declare_parameter(side + ".topics.nitros_image.qos.durability",  std::string("volatile"));
-    declare_parameter(side + ".topics.nitros_image.format",    std::string("nv12"));
+    // FIX 1.1: default changed from "nv12" to "rgb8" — nv12 via TypeAdapter is broken
+    // (TypeAdapter cudaMemcpy2D only copies the Y plane; UV stays uninitialized → green screen)
+    declare_parameter(side + ".topics.nitros_image.format",    std::string("rgb8"));
     declare_parameter(side + ".topics.nitros_image.fps",       30);
     declare_parameter(side + ".topics.nitros_image.resolution.width",  -1);
     declare_parameter(side + ".topics.nitros_image.resolution.height", -1);
@@ -204,9 +124,10 @@ ArducamDualCamNode::ArducamDualCamNode(const rclcpp::NodeOptions & options)
     topic_vis_right_  = (vis_transport_right_ == "compressed") ? pfx_r + "/image/compressed"
                                                                : pfx_r + "/image_raw";
     topic_left_info_  = (vis_transport_left_  == "compressed") ? pfx_l + "/image/camera_info"
-                                                                : pfx_l + "/camera_info";    
-    topic_right_info_ = (vis_transport_left_  == "compressed") ? pfx_r + "/image/camera_info"
-                                                                : pfx_r + "/camera_info"; 
+                                                                : pfx_l + "/camera_info";
+    // FIX 1.2: was incorrectly using vis_transport_left_ — right side topic depended on left's transport
+    topic_right_info_ = (vis_transport_right_ == "compressed") ? pfx_r + "/image/camera_info"
+                                                                : pfx_r + "/camera_info";
   }
 
   // visual_stream output resolution
@@ -238,6 +159,25 @@ ArducamDualCamNode::ArducamDualCamNode(const rclcpp::NodeOptions & options)
   pub_nitros_right_     = get_parameter("right_camera.topics.nitros_image.enable").as_bool();
   nitros_fmt_left_      = get_parameter("left_camera.topics.nitros_image.format").as_string();
   nitros_fmt_right_     = get_parameter("right_camera.topics.nitros_image.format").as_string();
+
+  // FIX 1.1: nv12 via TypeAdapter only copies the Y plane; UV plane in the GXF
+  // VideoBuffer is never populated → downstream receives random chroma.  Refuse
+  // early with a clear message rather than producing a silent green-screen image.
+  {
+    const bool bad_l = pub_nitros_left_  && nitros_fmt_left_  == "nv12";
+    const bool bad_r = pub_nitros_right_ && nitros_fmt_right_ == "nv12";
+    if (bad_l || bad_r) {
+      RCLCPP_FATAL(get_logger(),
+        "nitros_image.format='nv12' is NOT supported via the TypeAdapter path: "
+        "convert_to_custom() calls a single cudaMemcpy2D(height=img.height) which "
+        "only copies the Y plane; the UV plane in the GXF VideoBuffer is never "
+        "written and downstream nodes see random/zero chroma (green screen). "
+        "Set format to 'rgb8' or 'bgr8' instead. "
+        "(left=%s, right=%s)",
+        nitros_fmt_left_.c_str(), nitros_fmt_right_.c_str());
+      throw std::runtime_error("Unsupported nitros_image.format='nv12'");
+    }
+  }
 
   RCLCPP_INFO(get_logger(),
     "Arducam B0573 | device=%s  combined=%dx%d  eye=%dx%d  fps=%d  fmt=%s",
@@ -731,10 +671,15 @@ void ArducamDualCamNode::init_nvbuf_surfaces()
   //   planeIdx=0 would leave addr[1] null → std::memcpy on the UV plane SEGFAULTs.
   // NVBUF_MAP_READ_WRITE → VIC writes to this surface as the transform destination;
   //   READ-only mapping does not reflect those writes after NvBufSurfaceSyncForCpu.
-  if (NvBufSurfaceMap(nvbuf_left_,  0, -1, NVBUF_MAP_READ_WRITE) != 0 ||
-      NvBufSurfaceMap(nvbuf_right_, 0, -1, NVBUF_MAP_READ_WRITE) != 0) {
+  // FIX 1.3: track each map individually so we can UnMap before Destroy on
+  // partial failure — destroying a still-mapped surface leaks the kernel nvmap handle.
+  const bool map_left_ok  = (NvBufSurfaceMap(nvbuf_left_,  0, -1, NVBUF_MAP_READ_WRITE) == 0);
+  const bool map_right_ok = map_left_ok &&
+                            (NvBufSurfaceMap(nvbuf_right_, 0, -1, NVBUF_MAP_READ_WRITE) == 0);
+  if (!map_left_ok || !map_right_ok) {
     RCLCPP_WARN(get_logger(),
       "NvBufSurfaceMap (NV12) failed — VIC path disabled");
+    if (map_left_ok) NvBufSurfaceUnMap(nvbuf_left_, 0, -1);  // unmap before destroy
     NvBufSurfaceDestroy(nvbuf_left_);  nvbuf_left_  = nullptr;
     NvBufSurfaceDestroy(nvbuf_right_); nvbuf_right_ = nullptr;
     if (nvbuf_raw_left_)  { NvBufSurfaceDestroy(nvbuf_raw_left_);  nvbuf_raw_left_  = nullptr; }
@@ -744,17 +689,53 @@ void ArducamDualCamNode::init_nvbuf_surfaces()
 
   // Map BGRA surfaces (single plane, planeIdx=-1 == 0 for packed formats, but
   // -1 is safe and consistent).
+  // FIX 1.3 (BGRA): same pattern — track each map to unmap before Destroy on failure.
   if (nvbuf_raw_left_ && nvbuf_raw_right_) {
-    if (NvBufSurfaceMap(nvbuf_raw_left_,  0, -1, NVBUF_MAP_READ_WRITE) != 0 ||
-        NvBufSurfaceMap(nvbuf_raw_right_, 0, -1, NVBUF_MAP_READ_WRITE) != 0) {
+    const bool raw_left_ok  = (NvBufSurfaceMap(nvbuf_raw_left_,  0, -1, NVBUF_MAP_READ_WRITE) == 0);
+    const bool raw_right_ok = raw_left_ok &&
+                              (NvBufSurfaceMap(nvbuf_raw_right_, 0, -1, NVBUF_MAP_READ_WRITE) == 0);
+    if (!raw_left_ok || !raw_right_ok) {
       RCLCPP_WARN(get_logger(),
         "NvBufSurfaceMap (BGRA) failed — image_raw will use CPU cvtColor fallback");
+      if (raw_left_ok) NvBufSurfaceUnMap(nvbuf_raw_left_, 0, -1);  // unmap before destroy
       NvBufSurfaceDestroy(nvbuf_raw_left_);  nvbuf_raw_left_  = nullptr;
       NvBufSurfaceDestroy(nvbuf_raw_right_); nvbuf_raw_right_ = nullptr;
     }
   }
 
   use_nvbuf_ = true;
+
+  // FIX 2.2: Pre-size the staging image data buffers once so that make_nitros_image's
+  // data.resize() on the per-frame hot path is always a no-op (vector already right size).
+  // nv12 is rejected in the constructor, so only rgb8/bgr8 (3 bytes/px) and mono8 (1 byte/px).
+  auto pre_size_nitros_img = [&](sensor_msgs::msg::Image & img, bool is_left) {
+    const int w = eff_out_w_nitros(is_left);
+    const int h = eff_out_h_nitros(is_left);
+    const std::string & fmt = is_left ? nitros_fmt_left_ : nitros_fmt_right_;
+    img.width  = static_cast<uint32_t>(w);
+    img.height = static_cast<uint32_t>(h);
+    const size_t bytes = (fmt == "mono8")
+                         ? static_cast<size_t>(w) * static_cast<size_t>(h)
+                         : static_cast<size_t>(w) * static_cast<size_t>(h) * 3;
+    img.data.resize(bytes);  // allocates once; subsequent same-size resize() are no-ops
+  };
+  pre_size_nitros_img(nitros_img_left_,  true);
+  pre_size_nitros_img(nitros_img_right_, false);
+
+  // FIX 2.3: Pre-size the shared NV12 CPU de-stride staging buffer.
+  // Used only when BGRA VIC surfaces are unavailable. Size = eye_w × h × 3/2.
+  nv12_cpu_staging_.resize(
+    static_cast<size_t>(eye_width()) * static_cast<size_t>(combined_height_) * 3 / 2);
+
+  // FIX 3.2: Register a persistent VIC session so NvBufSurfTransformAsync actually
+  // enqueues work on Orin.  Without SetSessionParams, the call silently returns
+  // Success but submits nothing — the sync object never fires and the dst surface
+  // stays zero-initialised (green screen).
+  vic_session_.compute_mode = NvBufSurfTransformCompute_Default;  // driver picks VIC
+  vic_session_.gpu_id       = 0;
+  vic_session_.cuda_stream  = nullptr;  // VIC, not CUDA
+  NvBufSurfTransformSetSessionParams(&vic_session_);
+
   RCLCPP_INFO(get_logger(),
     "NvBufSurface ready  eye=%dx%d"
     "  NV12(NITROS): CPU-mapped via TypeAdapter"
@@ -831,62 +812,67 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
   tp_right.transform_filter = NvBufSurfTransformInter_Nearest;
   tp_right.src_rect         = &rect_right;
 
-  // ── NV12 crop (NITROS path) — synchronous NvBufSurfTransform ───────────────
-  // NvBufSurfTransformAsync requires a VIC session pre-configured via
-  // NvBufSurfTransformSetSessionParams.  Without it the call returns Success but
-  // submits no work and the sync object never fires — resulting in stale
-  // (zero-initialised) NV12 data reaching the CUDA staging buffer and a green
-  // screen in RViz2.  The synchronous API blocks until VIC completes and has
-  // no session requirement; it is the correct API for per-frame use here.
-  auto err_l = NvBufSurfTransform(src, nvbuf_left_,  &tp_left);
-  auto err_r = NvBufSurfTransform(src, nvbuf_right_, &tp_right);
+  // ── FIX 3.1+3.2: All 4 VIC transforms submitted async concurrently ──────────
+  // vic_session_ (set once in init_nvbuf_surfaces) enables NvBufSurfTransformAsync
+  // on Orin.  Submitting NV12_L, NV12_R, BGRA_L, BGRA_R all before waiting lets
+  // VIC pipeline them in its internal queue instead of blocking per-transform.
+  // Each pair reads from the same src (independent writes to distinct dst surfaces).
+  const bool want_raw     = vis_enable_left_ || vis_enable_right_;
+  const bool have_raw_surfs = nvbuf_raw_left_ && nvbuf_raw_right_;
 
+  NvBufSurfTransformParams tp_raw_left{};
+  NvBufSurfTransformParams tp_raw_right{};
+  if (want_raw && have_raw_surfs) {
+    tp_raw_left  = tp_left;
+    tp_raw_right = tp_right;
+    tp_raw_left.transform_flag  |= NVBUFSURF_TRANSFORM_FILTER;
+    tp_raw_right.transform_flag |= NVBUFSURF_TRANSFORM_FILTER;
+  }
+
+  NvBufSurfTransformSyncObj_t sync_nv12_l = nullptr;
+  NvBufSurfTransformSyncObj_t sync_nv12_r = nullptr;
+  NvBufSurfTransformSyncObj_t sync_bgra_l = nullptr;
+  NvBufSurfTransformSyncObj_t sync_bgra_r = nullptr;
+
+  // Submit NV12 crops async (session ensures VIC actually receives them)
+  auto err_l = NvBufSurfTransformAsync(src, nvbuf_left_,  &tp_left,  &sync_nv12_l);
+  auto err_r = NvBufSurfTransformAsync(src, nvbuf_right_, &tp_right, &sync_nv12_r);
   if (err_l != NvBufSurfTransformError_Success ||
       err_r != NvBufSurfTransformError_Success)
   {
     RCLCPP_WARN_ONCE(get_logger(),
-      "NvBufSurfTransform (NV12) failed (err_l=%d err_r=%d) — "
+      "NvBufSurfTransformAsync (NV12) failed (err_l=%d err_r=%d) — "
       "disabling VIC path", static_cast<int>(err_l), static_cast<int>(err_r));
+    if (sync_nv12_l) NvBufSurfTransformSyncObjDestroy(&sync_nv12_l);
+    if (sync_nv12_r) NvBufSurfTransformSyncObjDestroy(&sync_nv12_r);
     gst_buffer_unmap(buf, &map);
     use_nvbuf_ = false;
     return false;
   }
 
-  // ── image_raw VIC path: NV12→BGRA crop (async, session not required for FILTER path) ─
-  const bool want_raw = vis_enable_left_ || vis_enable_right_;
-  const bool have_raw_surfs = nvbuf_raw_left_ && nvbuf_raw_right_;
-  NvBufSurfTransformSyncObj_t sync_raw_left  = nullptr;
-  NvBufSurfTransformSyncObj_t sync_raw_right = nullptr;
-
+  // Submit BGRA crops async — VIC queues behind NV12 jobs, overlaps with CPU work
   if (want_raw && have_raw_surfs) {
-    // FILTER flag is required when color format differs between src and dst so
-    // VIC applies the colour matrix in the same pass as the crop.
-    NvBufSurfTransformParams tp_raw_left  = tp_left;
-    NvBufSurfTransformParams tp_raw_right = tp_right;
-    tp_raw_left.transform_flag  |= NVBUFSURF_TRANSFORM_FILTER;
-    tp_raw_right.transform_flag |= NVBUFSURF_TRANSFORM_FILTER;
-    auto err_raw_l = NvBufSurfTransformAsync(src, nvbuf_raw_left_,  &tp_raw_left,  &sync_raw_left);
-    auto err_raw_r = NvBufSurfTransformAsync(src, nvbuf_raw_right_, &tp_raw_right, &sync_raw_right);
-    if (err_raw_l != NvBufSurfTransformError_Success ||
-        err_raw_r != NvBufSurfTransformError_Success) {
+    auto err_bl = NvBufSurfTransformAsync(src, nvbuf_raw_left_,  &tp_raw_left,  &sync_bgra_l);
+    auto err_br = NvBufSurfTransformAsync(src, nvbuf_raw_right_, &tp_raw_right, &sync_bgra_r);
+    if (err_bl != NvBufSurfTransformError_Success ||
+        err_br != NvBufSurfTransformError_Success) {
       RCLCPP_WARN_ONCE(get_logger(),
-        "NvBufSurfTransformAsync (BGRA/image_raw) failed (err_l=%d err_r=%d)"
-        " — visual_stream will use CPU fallback this frame",
-        static_cast<int>(err_raw_l), static_cast<int>(err_raw_r));
-      if (sync_raw_left)  { NvBufSurfTransformSyncObjDestroy(&sync_raw_left);  sync_raw_left  = nullptr; }
-      if (sync_raw_right) { NvBufSurfTransformSyncObjDestroy(&sync_raw_right); sync_raw_right = nullptr; }
+        "NvBufSurfTransformAsync (BGRA) failed (err_l=%d err_r=%d)"
+        " — visual_stream will use CPU fallback",
+        static_cast<int>(err_bl), static_cast<int>(err_br));
+      if (sync_bgra_l) { NvBufSurfTransformSyncObjDestroy(&sync_bgra_l); sync_bgra_l = nullptr; }
+      if (sync_bgra_r) { NvBufSurfTransformSyncObjDestroy(&sync_bgra_r); sync_bgra_r = nullptr; }
     }
   }
 
-  // Wait for BGRA async jobs (NV12 is already done — synchronous above)
-  if (sync_raw_left)  {
-    NvBufSurfTransformSyncObjWait(sync_raw_left,  -1);
-    NvBufSurfTransformSyncObjDestroy(&sync_raw_left);
-  }
-  if (sync_raw_right) {
-    NvBufSurfTransformSyncObjWait(sync_raw_right, -1);
-    NvBufSurfTransformSyncObjDestroy(&sync_raw_right);
-  }
+  // Wait for all submitted jobs then release src
+  auto wait_and_destroy = [](NvBufSurfTransformSyncObj_t & s) {
+    if (s) { NvBufSurfTransformSyncObjWait(s, -1); NvBufSurfTransformSyncObjDestroy(&s); }
+  };
+  wait_and_destroy(sync_nv12_l);
+  wait_and_destroy(sync_nv12_r);
+  wait_and_destroy(sync_bgra_l);
+  wait_and_destroy(sync_bgra_r);
 
   gst_buffer_unmap(buf, &map);  // release NVMM src reference; dst is independent
 
@@ -960,14 +946,23 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
         nv12_surf->surfaceList[0].mappedAddr.addr[1]);
       const size_t pitch_y  = nv12_surf->surfaceList[0].planeParams.pitch[0];
       const size_t pitch_uv = nv12_surf->surfaceList[0].planeParams.pitch[1];
-      std::vector<uint8_t> nv12_buf(static_cast<size_t>(ew * combined_height_ * 3 / 2));
-      for (int r = 0; r < combined_height_; ++r) {
-        std::memcpy(nv12_buf.data() + r * ew, y_src + r * pitch_y,
-                    static_cast<size_t>(ew));
+      // FIX 2.3: use pre-allocated staging buffer instead of per-frame malloc
+      std::vector<uint8_t> & nv12_buf = nv12_cpu_staging_;
+      // FIX 3.5: single bulk memcpy when VIC output is already packed (pitch == width)
+      const size_t y_size  = static_cast<size_t>(ew) * static_cast<size_t>(combined_height_);
+      const size_t uv_size = static_cast<size_t>(ew) * static_cast<size_t>(combined_height_ / 2);
+      if (pitch_y == static_cast<size_t>(ew)) {
+        std::memcpy(nv12_buf.data(), y_src, y_size);
+      } else {
+        for (int r = 0; r < combined_height_; ++r)
+          std::memcpy(nv12_buf.data() + r * ew, y_src + r * pitch_y, static_cast<size_t>(ew));
       }
-      for (int r = 0; r < combined_height_ / 2; ++r) {
-        std::memcpy(nv12_buf.data() + ew * combined_height_ + r * ew,
-                    uv_src + r * pitch_uv, static_cast<size_t>(ew));
+      if (pitch_uv == static_cast<size_t>(ew)) {
+        std::memcpy(nv12_buf.data() + y_size, uv_src, uv_size);
+      } else {
+        for (int r = 0; r < combined_height_ / 2; ++r)
+          std::memcpy(nv12_buf.data() + ew * combined_height_ + r * ew,
+                      uv_src + r * pitch_uv, static_cast<size_t>(ew));
       }
       cv::Mat nv12_mat(combined_height_ * 3 / 2, ew, CV_8UC1, nv12_buf.data());
       cv::cvtColor(nv12_mat, bgr, cv::COLOR_YUV2BGR_NV12);
@@ -992,13 +987,22 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
     hdr.frame_id = frame_id;
 
     if (transport == "compressed") {
-      std::vector<uchar> jpeg_buf;
-      cv::imencode(".jpg", out, jpeg_buf, {cv::IMWRITE_JPEG_QUALITY, jpeg_q});
-      sensor_msgs::msg::CompressedImage msg;
-      msg.header = hdr;
-      msg.format = encoding + "; jpeg compressed " + encoding;
-      msg.data   = std::move(jpeg_buf);
-      (is_left ? pub_vis_comp_left_ : pub_vis_comp_right_)->publish(msg);
+      // FIX 3.3: JPEG encode off the capture thread (~3–8 ms) so VIC isn't stalled.
+      // Wait for previous frame's encode first, clone `out`, then fire async.
+      std::future<void> & fut = is_left ? jpeg_future_left_ : jpeg_future_right_;
+      if (fut.valid()) fut.get();
+      cv::Mat out_copy = out.clone();
+      auto pub = is_left ? pub_vis_comp_left_ : pub_vis_comp_right_;
+      fut = std::async(std::launch::async,
+        [pub, out_copy = std::move(out_copy), enc = encoding, q = jpeg_q, hdr]() mutable {
+          std::vector<uchar> jpeg_buf;
+          cv::imencode(".jpg", out_copy, jpeg_buf, {cv::IMWRITE_JPEG_QUALITY, q});
+          sensor_msgs::msg::CompressedImage msg;
+          msg.header = hdr;
+          msg.format = enc + "; jpeg compressed " + enc;
+          msg.data   = std::move(jpeg_buf);
+          pub->publish(msg);
+        });
     } else {
       auto img_msg = cv_bridge::CvImage(hdr, encoding, out).toImageMsg();
       (is_left ? pub_vis_raw_left_ : pub_vis_raw_right_)->publish(
@@ -1031,15 +1035,17 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
   // side, bgr_cache_{left,right} holds that result at surface resolution so the
   // NEON pass is skipped entirely here.
   // cv::resize handles the optional output-resolution downscale.
+  // FIX 2.2: lambda now fills a pre-allocated image in-place — no malloc on hot path.
+  // img.data is pre-sized in init_nvbuf_surfaces(); resize() here is a no-op.
   auto make_nitros_image = [&](
+    sensor_msgs::msg::Image & img,       // pre-allocated staging image; filled in place
     NvBufSurface * nv12_surf,    // VIC-cropped NV12 surface (eye_width × combined_height)
     NvBufSurface * bgra_surf,    // VIC-cropped BGRA surface, or nullptr
     const cv::Mat & bgr_hint,    // optional BGR mat at surf dims from visual path; skips redo
     const std::string & frame_id,
     const std::string & enc,
-    int out_w, int out_h) -> sensor_msgs::msg::Image
+    int out_w, int out_h) -> void
   {
-    sensor_msgs::msg::Image img;
     img.header.stamp    = stamp;
     img.header.frame_id = frame_id;
     img.width           = static_cast<uint32_t>(out_w);
@@ -1060,17 +1066,23 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
       const int surf_w = eye_width();
       const int surf_h = combined_height_;
       cv::Mat bgr;
+      bool already_rgb = false;  // FIX 3.4: track if bgr already holds RGB data
 
       if (!bgr_hint.empty()) {
         // Reuse BGR mat already computed by publish_visual_side — no extra NEON pass
         bgr = bgr_hint;
       } else if (bgra_surf) {
-        // BGRA VIC path: BGRA→BGR in one NEON pass, no NV12 de-stride needed
+        // FIX 3.4: go directly to the target colour space — skip the second pass
         const auto & sl = bgra_surf->surfaceList[0];
         auto * ptr = static_cast<uint8_t *>(sl.mappedAddr.addr[0]);
         cv::Mat bgra_mat(surf_h, surf_w, CV_8UC4, ptr,
                          static_cast<size_t>(sl.planeParams.pitch[0]));
-        cv::cvtColor(bgra_mat, bgr, cv::COLOR_BGRA2BGR);
+        if (enc == "rgb8") {
+          cv::cvtColor(bgra_mat, bgr, cv::COLOR_BGRA2RGB);  // single NEON pass straight to RGB
+          already_rgb = true;
+        } else {
+          cv::cvtColor(bgra_mat, bgr, cv::COLOR_BGRA2BGR);
+        }
       } else {
         // CPU NV12 fallback: de-stride then cvtColor
         const auto & sl = nv12_surf->surfaceList[0];
@@ -1078,13 +1090,24 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
         const auto * uv_src = static_cast<const uint8_t *>(sl.mappedAddr.addr[1]);
         const size_t py = sl.planeParams.pitch[0];
         const size_t pu = sl.planeParams.pitch[1];
-        std::vector<uint8_t> nv12_buf(
-          static_cast<size_t>(surf_w) * static_cast<size_t>(surf_h) * 3 / 2);
-        for (int r = 0; r < surf_h; ++r)
-          std::memcpy(nv12_buf.data() + r * surf_w, y_src + r * py, surf_w);
-        for (int r = 0; r < surf_h / 2; ++r)
-          std::memcpy(nv12_buf.data() + surf_w * surf_h + r * surf_w,
-                      uv_src + r * pu, surf_w);
+        // FIX 2.3: use pre-allocated staging buffer instead of per-frame malloc
+        std::vector<uint8_t> & nv12_buf = nv12_cpu_staging_;
+        // FIX 3.5: single bulk memcpy when VIC output is already packed
+        const size_t y_sz  = static_cast<size_t>(surf_w) * static_cast<size_t>(surf_h);
+        const size_t uv_sz = static_cast<size_t>(surf_w) * static_cast<size_t>(surf_h / 2);
+        if (py == static_cast<size_t>(surf_w)) {
+          std::memcpy(nv12_buf.data(), y_src, y_sz);
+        } else {
+          for (int r = 0; r < surf_h; ++r)
+            std::memcpy(nv12_buf.data() + r * surf_w, y_src + r * py, surf_w);
+        }
+        if (pu == static_cast<size_t>(surf_w)) {
+          std::memcpy(nv12_buf.data() + y_sz, uv_src, uv_sz);
+        } else {
+          for (int r = 0; r < surf_h / 2; ++r)
+            std::memcpy(nv12_buf.data() + surf_w * surf_h + r * surf_w,
+                        uv_src + r * pu, surf_w);
+        }
         cv::Mat nv12_mat(surf_h * 3 / 2, surf_w, CV_8UC1, nv12_buf.data());
         cv::cvtColor(nv12_mat, bgr, cv::COLOR_YUV2BGR_NV12);
       }
@@ -1093,10 +1116,10 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
       if (out_w != bgr.cols || out_h != bgr.rows)
         cv::resize(bgr, bgr, cv::Size(out_w, out_h));
 
-      // Convert BGR → RGB if needed
+      // Convert BGR → RGB if needed (skipped when FIX 3.4 already produced RGB above)
       cv::Mat * out_ptr = &bgr;
       cv::Mat rgb_tmp;
-      if (enc == "rgb8") {
+      if (enc == "rgb8" && !already_rgb) {
         cv::cvtColor(bgr, rgb_tmp, cv::COLOR_BGR2RGB);
         out_ptr = &rgb_tmp;
       }
@@ -1112,9 +1135,15 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
       const auto & sl = nv12_surf->surfaceList[0];
       const auto * y  = static_cast<const uint8_t *>(sl.mappedAddr.addr[0]);
       const size_t py = sl.planeParams.pitch[0];
-      for (int r = 0; r < out_h; ++r)
-        std::memcpy(img.data.data() + r * out_w, y + r * py,
-                    static_cast<size_t>(out_w));
+      // FIX 3.5: bulk copy when VIC Y plane is packed
+      if (py == static_cast<size_t>(out_w)) {
+        std::memcpy(img.data.data(), y,
+                    static_cast<size_t>(out_w) * static_cast<size_t>(out_h));
+      } else {
+        for (int r = 0; r < out_h; ++r)
+          std::memcpy(img.data.data() + r * out_w, y + r * py,
+                      static_cast<size_t>(out_w));
+      }
 
     } else {
       // ── NV12 (and any unrecognised encoding) ──────────────────────────────
@@ -1137,13 +1166,24 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
       const auto * uv  = static_cast<const uint8_t *>(sl.mappedAddr.addr[1]);
       const size_t py  = sl.planeParams.pitch[0];
       const size_t pu  = sl.planeParams.pitch[1];
-      for (int r = 0; r < out_h; ++r)
-        std::memcpy(dst + r * out_w, y + r * py, static_cast<size_t>(out_w));
+      // FIX 3.5: bulk copy when VIC Y/UV planes are packed
+      const size_t y_bytes  = static_cast<size_t>(out_w) * static_cast<size_t>(out_h);
+      const size_t uv_bytes = static_cast<size_t>(out_w) * static_cast<size_t>(out_h / 2);
+      if (py == static_cast<size_t>(out_w)) {
+        std::memcpy(dst, y, y_bytes);
+      } else {
+        for (int r = 0; r < out_h; ++r)
+          std::memcpy(dst + r * out_w, y + r * py, static_cast<size_t>(out_w));
+      }
       uint8_t * dst_uv = dst + out_w * out_h;
-      for (int r = 0; r < out_h / 2; ++r)
-        std::memcpy(dst_uv + r * out_w, uv + r * pu, static_cast<size_t>(out_w));
+      if (pu == static_cast<size_t>(out_w)) {
+        std::memcpy(dst_uv, uv, uv_bytes);
+      } else {
+        for (int r = 0; r < out_h / 2; ++r)
+          std::memcpy(dst_uv + r * out_w, uv + r * pu, static_cast<size_t>(out_w));
+      }
     }
-    return img;
+    // void lambda — img is modified in place; no return value
   };
 
   RCLCPP_INFO_ONCE(get_logger(),
@@ -1151,20 +1191,22 @@ bool ArducamDualCamNode::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Tim
     nitros_fmt_left_.c_str(), nitros_fmt_right_.c_str(), ew, combined_height_);
 
   if (pub_nitros_left_) {
-    auto img = make_nitros_image(
+    make_nitros_image(
+      nitros_img_left_,
       nvbuf_left_,  have_raw_surfs ? nvbuf_raw_left_  : nullptr,
       bgr_cache_left,
       frame_id_left_,  nitros_fmt_left_,
       eff_out_w_nitros(true),  eff_out_h_nitros(true));
-    pub_left_nitros_->publish(img);
+    pub_left_nitros_->publish(nitros_img_left_);
   }
   if (pub_nitros_right_) {
-    auto img = make_nitros_image(
+    make_nitros_image(
+      nitros_img_right_,
       nvbuf_right_, have_raw_surfs ? nvbuf_raw_right_ : nullptr,
       bgr_cache_right,
       frame_id_right_, nitros_fmt_right_,
       eff_out_w_nitros(false), eff_out_h_nitros(false));
-    pub_right_nitros_->publish(img);
+    pub_right_nitros_->publish(nitros_img_right_);
   }
 
   return true;
@@ -1349,13 +1391,21 @@ void ArducamDualCamNode::process_sample(GstSample * sample)
     hdr.frame_id = frame_id;
 
     if (transport == "compressed") {
-      std::vector<uchar> jpeg_buf;
-      cv::imencode(".jpg", out, jpeg_buf, {cv::IMWRITE_JPEG_QUALITY, jpeg_q});
-      sensor_msgs::msg::CompressedImage msg;
-      msg.header = hdr;
-      msg.format = encoding + "; jpeg compressed " + encoding;
-      msg.data   = std::move(jpeg_buf);
-      (is_left ? pub_vis_comp_left_ : pub_vis_comp_right_)->publish(msg);
+      // FIX 3.3 (CPU path): same async JPEG pattern as NVBUF path.
+      std::future<void> & fut = is_left ? jpeg_future_left_ : jpeg_future_right_;
+      if (fut.valid()) fut.get();
+      cv::Mat out_copy = out.clone();
+      auto pub = is_left ? pub_vis_comp_left_ : pub_vis_comp_right_;
+      fut = std::async(std::launch::async,
+        [pub, out_copy = std::move(out_copy), enc = encoding, q = jpeg_q, hdr]() mutable {
+          std::vector<uchar> jpeg_buf;
+          cv::imencode(".jpg", out_copy, jpeg_buf, {cv::IMWRITE_JPEG_QUALITY, q});
+          sensor_msgs::msg::CompressedImage msg;
+          msg.header = hdr;
+          msg.format = enc + "; jpeg compressed " + enc;
+          msg.data   = std::move(jpeg_buf);
+          pub->publish(msg);
+        });
     } else {
       auto sp = cv_bridge::CvImage(hdr, encoding, out).toImageMsg();
       (is_left ? pub_vis_raw_left_ : pub_vis_raw_right_)->publish(
