@@ -35,7 +35,7 @@ The node captures a hardware-synchronized side-by-side (SBS) stereo frame from t
 |---|---|
 | Sensor | OV2311 Global Shutter (1600×1200 native per eye) |
 | Interface | GMSL2 → CSI-2 single cable, `/dev/video0` |
-| Platform | NVIDIA Jetson Orin Nano (JetPack 6.2+, DeepStream 7.1+) |
+| Platform | NVIDIA Jetson Orin NX/Nano (JetPack 6.2+, DeepStream 7.1+) |
 | Synchronization | Hardware-locked — both eyes share the same V4L2 buffer PTS |
 
 ---
