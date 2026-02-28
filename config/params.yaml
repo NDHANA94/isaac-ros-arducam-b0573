@@ -23,6 +23,8 @@ arducam_b0573_node:
 
     left_camera:
       frame_id: "left_camera"
+      # TODO: rectilinear: true  # If false, the node will publish the raw fisheye images without rectification. 
+      #                    # Set to true if you want the node to perform rectification using the provided intrinsics and extrinsics.
 
       topics:
         topic_name_prefix: "/arducam/left"
@@ -51,7 +53,9 @@ arducam_b0573_node:
             width: -1
             height: -1
 
-        camera_info:
+        # TODO: This should be removed and should mirror the camera_info topic published by the annotated_image_publisher_node
+        # (currently a duplicate with potentially different QoS settings, which is confusing and error-prone)
+        camera_info:  
           qos:
             reliability: "reliable"
             durability: "volatile"
@@ -100,12 +104,14 @@ arducam_b0573_node:
 
     right_camera:
       frame_id: "right_camera"
+      # TODO: rectilinear: true  # If false, the node will publish the raw fisheye images without rectification. 
+      #                    # Set to true if you want the node to perform rectification using the provided intrinsics and extrinsics.
 
       # ---- RIGHT CAMERA TOPICS ----
       topics:
-        topic_name_prefix: "/arducam/right"
+        topic_name_prefix: "/arducam/right"  # 
 
-        visual_stream:
+        visual_stream: # topic name: {topic_name_prefix}/image/{transport}
           enable: true
           transport: "compressed"        # raw | compressed
           encoding: "bgr8"               # bgr8 | rgb8
@@ -118,10 +124,10 @@ arducam_b0573_node:
             width: -1
             height: -1
 
-        nitros_image:
+        nitros_image: # topic name: {topic_name_prefix}/nitros_image_{format}
           enable: true
           qos:
-            reliability: "reliable"   # NITROS zero-copy works well with best_effort
+            reliability: "reliable"      # NITROS zero-copy works well with best_effort
             durability: "volatile"       # volatile | transient_local
           format: "rgb8"                 # Supported: "rgb8", "bgr8"
           fps: 30                        # Target frame rate for publishing the NITROS image stream. Actual frame rate may be lower if the camera cannot keep up.
@@ -129,7 +135,7 @@ arducam_b0573_node:
             width: -1
             height: -1
 
-        camera_info:
+        camera_info:  
           qos:
             reliability: "reliable"
             durability: "volatile"
