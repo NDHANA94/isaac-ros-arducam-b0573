@@ -8,8 +8,8 @@ arducam_b0573_node:
     #   3840 × 1200  →  1920 × 1200 per eye
     #   2560 ×  720  →  1280 ×  720 per eye  (default)
     #   1280 ×  480  →   640 ×  480 per eye
-    width:  1280
-    height: 480
+    width:  3840
+    height: 1200
 
     # Target frame rate (0 = let the V4L2 driver negotiate)
     fps: 30
@@ -23,8 +23,10 @@ arducam_b0573_node:
 
     left_camera:
       frame_id: "left_camera"
-      # TODO: rectilinear: true  # If false, the node will publish the raw fisheye images without rectification. 
-      #                    # Set to true if you want the node to perform rectification using the provided intrinsics and extrinsics.
+      # When true the node applies GPU (CUDA bilinear) lens-distortion rectification
+      # using the intrinsics.distortion_coefficients and intrinsics.projection_matrix
+      # declared below.  Rectification happens after VIC crop — no CPU pixel loops.
+      rectilinear: false
 
       topics:
         topic_name_prefix: "/arducam/left"
@@ -104,8 +106,10 @@ arducam_b0573_node:
 
     right_camera:
       frame_id: "right_camera"
-      # TODO: rectilinear: true  # If false, the node will publish the raw fisheye images without rectification. 
-      #                    # Set to true if you want the node to perform rectification using the provided intrinsics and extrinsics.
+      # When true the node applies GPU (CUDA bilinear) lens-distortion rectification
+      # using the intrinsics.distortion_coefficients and intrinsics.projection_matrix
+      # declared below.  Rectification happens after VIC crop — no CPU pixel loops.
+      rectilinear: false
 
       # ---- RIGHT CAMERA TOPICS ----
       topics:

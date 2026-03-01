@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.8)
-project(isaac_ros_arducam_b0573)
+project(isaac_ros_arducam_b0573 LANGUAGES CXX CUDA)
+
+# ── CUDA architecture (Jetson Orin = Ampere sm_87) ────────────────────────────
+# This matches -arch=sm_87 in nvcc and avoids JIT compilation at runtime.
+set(CMAKE_CUDA_ARCHITECTURES 87)
 
 # ── Compiler settings ─────────────────────────────────────────────────────────
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -18,6 +22,9 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# ── CUDA Toolkit (for cudaMalloc, cudaMemcpy, etc in the .cpp, not just .cu) ──
+find_package(CUDAToolkit REQUIRED)
 
 # ── ROS 2 dependencies ────────────────────────────────────────────────────────
 find_package(ament_cmake REQUIRED)
@@ -86,6 +93,7 @@ set(ROS_DEPS
 #     executable (arducam_b0573_node) for use outside a container.
 add_library(isaac_ros_arducam_b0573_component SHARED
   src/arducam_b0573_node.cpp
+  src/rectification_kernels.cu   # CUDA bilinear remap for lens-distortion rectification
 )
 
 target_include_directories(isaac_ros_arducam_b0573_component PUBLIC
@@ -98,6 +106,7 @@ target_include_directories(isaac_ros_arducam_b0573_component PUBLIC
 target_link_libraries(isaac_ros_arducam_b0573_component
   ${GST_LIBRARIES}
   ${OpenCV_LIBS}
+  CUDA::cudart           # cudaMalloc / cudaMemcpy / stream APIs called from .cpp
 )
 
 # ── Optional NvBufSurface / NvBufSurfTransform + Isaac ROS NITROS ─────────────

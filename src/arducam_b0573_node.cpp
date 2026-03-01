@@ -42,6 +42,14 @@
 #ifdef HAVE_NVBUF
 #include "isaac_ros_nitros_image_type/nitros_image.hpp"
 using nvidia::isaac_ros::nitros::NitrosImage;
+
+// CUDA remap kernel (defined in rectification_kernels.cu, compiled as a CUDA TU).
+// Both d_src and d_dst must be packed BGRA device buffers (pitch = w*4).
+// Function is asynchronous; caller synchronises the stream.
+extern "C" void cuda_remap_bgra(
+  const uint8_t* d_src, uint8_t* d_dst,
+  const float* d_map_x, const float* d_map_y,
+  int w, int h, cudaStream_t stream);
 #endif
 
 #include <gst/gst.h>
@@ -75,6 +83,8 @@ ArducamB0573Node::ArducamB0573Node(const rclcpp::NodeOptions & options)
     const bool is_left = (side == "left_camera");
     declare_parameter(side + ".frame_id",
       is_left ? "left_camera" : "right_camera");
+    // GPU lens-distortion rectification (CUDA bilinear remap after VIC crop)
+    declare_parameter(side + ".rectilinear", false);
 
     // ── topics.visual_stream ────────────────────────────────────────────────
     declare_parameter(side + ".topics.topic_name_prefix",
@@ -132,6 +142,8 @@ ArducamB0573Node::ArducamB0573Node(const rclcpp::NodeOptions & options)
   // ── Read per-camera visual_stream config ──────────────────────────────────
   frame_id_left_  = get_parameter("left_camera.frame_id").as_string();
   frame_id_right_ = get_parameter("right_camera.frame_id").as_string();
+  rectify_left_   = get_parameter("left_camera.rectilinear").as_bool();
+  rectify_right_  = get_parameter("right_camera.rectilinear").as_bool();
 
   vis_enable_left_       = get_parameter("left_camera.topics.visual_stream.enable").as_bool();
   vis_enable_right_      = get_parameter("right_camera.topics.visual_stream.enable").as_bool();
@@ -769,6 +781,12 @@ void ArducamB0573Node::init_nvbuf_surfaces()
     "  BGRA(image_raw): %s",
     eye_width(), combined_height_,
     (nvbuf_raw_left_ && nvbuf_raw_right_) ? "VIC hw path" : "CPU cvtColor fallback");
+
+  // ── GPU rectification maps ────────────────────────────────────────────────
+  // Precompute float32 remap tables once via OpenCV (CPU, < 1 ms).
+  // Works even if one or both sides don't request rectification — the function
+  // skips allocation for sides with rectify_{left,right}_ == false.
+  init_rectification_maps();
 }
 
 // ── cleanup_nvbuf_surfaces() ──────────────────────────────────────────────────
@@ -794,7 +812,216 @@ void ArducamB0573Node::cleanup_nvbuf_surfaces()
     NvBufSurfaceDestroy(nvbuf_raw_right_);
     nvbuf_raw_right_ = nullptr;
   }
+
+  // ── CUDA rectification resources ──────────────────────────────────────────
+  if (rect_stream_) { cudaStreamDestroy(rect_stream_);  rect_stream_ = nullptr; }
+  if (d_rect_map_x_left_)  { cudaFree(d_rect_map_x_left_);  d_rect_map_x_left_  = nullptr; }
+  if (d_rect_map_y_left_)  { cudaFree(d_rect_map_y_left_);  d_rect_map_y_left_  = nullptr; }
+  if (d_rect_map_x_right_) { cudaFree(d_rect_map_x_right_); d_rect_map_x_right_ = nullptr; }
+  if (d_rect_map_y_right_) { cudaFree(d_rect_map_y_right_); d_rect_map_y_right_ = nullptr; }
+  if (d_rect_src_left_)    { cudaFree(d_rect_src_left_);    d_rect_src_left_    = nullptr; }
+  if (d_rect_src_right_)   { cudaFree(d_rect_src_right_);   d_rect_src_right_   = nullptr; }
+  if (d_rect_tmp_left_)    { cudaFree(d_rect_tmp_left_);    d_rect_tmp_left_    = nullptr; }
+  if (d_rect_tmp_right_)   { cudaFree(d_rect_tmp_right_);   d_rect_tmp_right_   = nullptr; }
+
   use_nvbuf_ = false;
+}
+
+// ── init_rectification_maps() ─────────────────────────────────────────────────
+// Called once from init_nvbuf_surfaces() after all NvBufSurfaces are ready.
+//
+// For each side where rectify_{left,right}_ = true:
+//   1. Extract K (3×3), D (Nx1), R (3×3), P (3×4) from cam_info_{left,right}_.
+//   2. cv::initUndistortRectifyMap → float32 map_x, map_y (CPU, ~0.5 ms).
+//   3. cudaMalloc + cudaMemcpy H→D for both maps.
+//   4. cudaMalloc packed BGRA staging (d_rect_src) and output (d_rect_tmp) buffers.
+//   5. Create a non-blocking CUDA stream for async remap.
+//
+// A single rect_stream_ is shared between both sides.
+// The fisheye model (thin_prism_fisheye / equidistant) is detected via
+// distortion_model and routes to cv::fisheye::initUndistortRectifyMap.
+void ArducamB0573Node::init_rectification_maps()
+{
+  if (!rectify_left_ && !rectify_right_) {
+    return;  // nothing to do — avoid creating a CUDA stream unnecessarily
+  }
+
+  const int ew = eye_width();
+  const int h  = combined_height_;
+  const cv::Size img_size(ew, h);
+  const size_t map_bytes  = static_cast<size_t>(ew) * static_cast<size_t>(h) * sizeof(float);
+  const size_t bgra_bytes = static_cast<size_t>(ew) * static_cast<size_t>(h) * 4;
+
+  // Helper: build remap maps for one calibration, upload to device, allocate bufs.
+  auto build_side = [&](
+    const sensor_msgs::msg::CameraInfo & ci,
+    float ** d_map_x, float ** d_map_y,
+    uint8_t ** d_src,  uint8_t ** d_tmp,
+    const std::string & side_name) -> bool
+  {
+    // ── Camera matrix K ─────────────────────────────────────────────────────
+    cv::Mat K = cv::Mat::eye(3, 3, CV_64F);
+    K.at<double>(0, 0) = ci.k[0]; K.at<double>(0, 2) = ci.k[2];
+    K.at<double>(1, 1) = ci.k[4]; K.at<double>(1, 2) = ci.k[5];
+
+    // ── Distortion coefficients D ────────────────────────────────────────────
+    cv::Mat D(static_cast<int>(ci.d.size()), 1, CV_64F);
+    for (size_t i = 0; i < ci.d.size(); ++i) D.at<double>(static_cast<int>(i), 0) = ci.d[i];
+
+    // ── Rectification matrix R ───────────────────────────────────────────────
+    cv::Mat R = cv::Mat::eye(3, 3, CV_64F);
+    if (ci.r.size() == 9) {
+      for (int i = 0; i < 9; ++i)
+        R.at<double>(i / 3, i % 3) = ci.r[i];
+    }
+
+    // ── New camera matrix P' (first 3×3 of P) ───────────────────────────────
+    // P is 3×4: [fx' 0 cx' Tx; 0 fy' cy' Ty; 0 0 1 0]
+    // cv::initUndistortRectifyMap needs the 3×3 part only.
+    cv::Mat P3(3, 3, CV_64F, cv::Scalar(0));
+    if (ci.p.size() == 12) {
+      P3.at<double>(0, 0) = ci.p[0]; P3.at<double>(0, 2) = ci.p[2];
+      P3.at<double>(1, 1) = ci.p[5]; P3.at<double>(1, 2) = ci.p[6];
+      P3.at<double>(2, 2) = 1.0;
+    } else {
+      P3 = K.clone();  // fall back to using K if P not populated
+    }
+
+    // ── Compute remap tables on CPU (once, ~0.5 ms) ──────────────────────────
+    cv::Mat map_x_cpu, map_y_cpu;
+    const bool is_fisheye =
+      ci.distortion_model == "equidistant" ||
+      ci.distortion_model == "thin_prism_fisheye" ||
+      ci.distortion_model == "kannala_brandt4";
+
+    try {
+      if (is_fisheye) {
+        // cv::fisheye::initUndistortRectifyMap requires D to be a 1×4 or 4×1 vector.
+        cv::Mat D4 = cv::Mat::zeros(4, 1, CV_64F);
+        for (int i = 0; i < std::min(4, D.rows); ++i)
+          D4.at<double>(i, 0) = D.at<double>(i, 0);
+        cv::fisheye::initUndistortRectifyMap(K, D4, R, P3, img_size, CV_32FC1, map_x_cpu, map_y_cpu);
+      } else {
+        cv::initUndistortRectifyMap(K, D, R, P3, img_size, CV_32FC1, map_x_cpu, map_y_cpu);
+      }
+    } catch (const cv::Exception & e) {
+      RCLCPP_ERROR(get_logger(),
+        "init_rectification_maps [%s]: cv::initUndistortRectifyMap failed: %s"
+        " — rectification disabled for this side", side_name.c_str(), e.what());
+      return false;
+    }
+
+    // ── Upload maps to device ────────────────────────────────────────────────
+    if (cudaMalloc(reinterpret_cast<void **>(d_map_x), map_bytes) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void **>(d_map_y), map_bytes) != cudaSuccess)
+    {
+      RCLCPP_ERROR(get_logger(), "init_rectification_maps [%s]: cudaMalloc maps failed",
+        side_name.c_str());
+      if (*d_map_x) { cudaFree(*d_map_x); *d_map_x = nullptr; }
+      return false;
+    }
+    cudaMemcpy(*d_map_x, map_x_cpu.data, map_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(*d_map_y, map_y_cpu.data, map_bytes, cudaMemcpyHostToDevice);
+
+    // ── Allocate packed BGRA device staging buffers ──────────────────────────
+    // d_src: H2D packed copy of the VIC surface (de-strided) before remap.
+    // d_tmp: remap output (packed BGRA), later copied back to the VIC surface.
+    if (cudaMalloc(reinterpret_cast<void **>(d_src), bgra_bytes) != cudaSuccess ||
+        cudaMalloc(reinterpret_cast<void **>(d_tmp), bgra_bytes) != cudaSuccess)
+    {
+      RCLCPP_ERROR(get_logger(), "init_rectification_maps [%s]: cudaMalloc BGRA bufs failed",
+        side_name.c_str());
+      if (*d_src) { cudaFree(*d_src); *d_src = nullptr; }
+      cudaFree(*d_map_x); *d_map_x = nullptr;
+      cudaFree(*d_map_y); *d_map_y = nullptr;
+      return false;
+    }
+
+    RCLCPP_INFO(get_logger(),
+      "Rectification maps [%s]: %dx%d  model=%s%s  maps=%.1f KB on GPU",
+      side_name.c_str(), ew, h, ci.distortion_model.c_str(),
+      is_fisheye ? " (fisheye)" : "",
+      static_cast<double>(map_bytes * 2) / 1024.0);
+    return true;
+  };
+
+  // Create a single non-blocking CUDA stream shared by both sides
+  cudaStreamCreateWithFlags(&rect_stream_, cudaStreamNonBlocking);
+
+  if (rectify_left_) {
+    const bool ok = build_side(cam_info_left_,
+      &d_rect_map_x_left_, &d_rect_map_y_left_,
+      &d_rect_src_left_,   &d_rect_tmp_left_,
+      "left");
+    if (!ok) {
+      RCLCPP_WARN(get_logger(), "Left rectification disabled due to init failure");
+      rectify_left_ = false;
+    }
+  }
+
+  if (rectify_right_) {
+    const bool ok = build_side(cam_info_right_,
+      &d_rect_map_x_right_, &d_rect_map_y_right_,
+      &d_rect_src_right_,   &d_rect_tmp_right_,
+      "right");
+    if (!ok) {
+      RCLCPP_WARN(get_logger(), "Right rectification disabled due to init failure");
+      rectify_right_ = false;
+    }
+  }
+}
+
+// ── apply_rect_bgra() ─────────────────────────────────────────────────────────
+// Per-frame CUDA rectification of a BGRA NvBufSurface (in-place on mappedAddr).
+//
+// Steps:
+//   1. cudaMemcpy2D: VIC surface (strided) → d_rect_src_  (packed, H2D)
+//   2. cuda_remap_bgra kernel: d_rect_src_ → d_rect_tmp_  (packed → packed)
+//   3. cudaStreamSynchronize
+//   4. cudaMemcpy2D: d_rect_tmp_ (packed) → VIC surface  (strided, D2H)
+//
+// After step 4 the VIC surface's CPU-mapped addr contains the rectified pixels.
+// The downstream publish_visual_side / make_nitros_image lambdas read from
+// mappedAddr, so they automatically see the rectified data.
+void ArducamB0573Node::apply_rect_bgra(NvBufSurface * surf, bool is_left)
+{
+  const int ew = eye_width();
+  const int h  = combined_height_;
+  const size_t packed_row  = static_cast<size_t>(ew) * 4;   // bytes/row in packed buffer
+  const size_t surf_pitch  = surf->surfaceList[0].planeParams.pitch[0]; // VIC surface pitch
+
+  uint8_t * const d_src = is_left ? d_rect_src_left_ : d_rect_src_right_;
+  uint8_t * const d_tmp = is_left ? d_rect_tmp_left_ : d_rect_tmp_right_;
+  const float * const d_mx = is_left ? d_rect_map_x_left_ : d_rect_map_x_right_;
+  const float * const d_my = is_left ? d_rect_map_y_left_ : d_rect_map_y_right_;
+
+  void * const cpu_addr = surf->surfaceList[0].mappedAddr.addr[0];
+
+  // ── Step 1: H2D — packed copy from VIC surface (remove alignment padding) ──
+  cudaMemcpy2D(
+    d_src,                       // dst device (packed)
+    packed_row,                  // dst pitch
+    cpu_addr,                    // src host  (VIC strided)
+    surf_pitch,                  // src pitch
+    packed_row,                  // width in bytes (= ew * 4)
+    static_cast<size_t>(h),
+    cudaMemcpyHostToDevice);
+
+  // ── Step 2: GPU remap (async) ─────────────────────────────────────────────
+  cuda_remap_bgra(d_src, d_tmp, d_mx, d_my, ew, h, rect_stream_);
+
+  // ── Step 3: Synchronise ───────────────────────────────────────────────────
+  cudaStreamSynchronize(rect_stream_);
+
+  // ── Step 4: D2H — write back to VIC surface (restore pitch alignment) ─────
+  cudaMemcpy2D(
+    cpu_addr,                    // dst host  (VIC strided)
+    surf_pitch,                  // dst pitch
+    d_tmp,                       // src device (packed)
+    packed_row,                  // src pitch
+    packed_row,                  // width in bytes
+    static_cast<size_t>(h),
+    cudaMemcpyDeviceToHost);
 }
 
 // ── process_sample_nvbuf() ────────────────────────────────────────────────────
@@ -844,7 +1071,8 @@ bool ArducamB0573Node::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Time 
   // on Orin.  Submitting NV12_L, NV12_R, BGRA_L, BGRA_R all before waiting lets
   // VIC pipeline them in its internal queue instead of blocking per-transform.
   // Each pair reads from the same src (independent writes to distinct dst surfaces).
-  const bool want_raw     = vis_enable_left_ || vis_enable_right_;
+  const bool want_raw     = vis_enable_left_ || vis_enable_right_
+                          || rectify_left_  || rectify_right_;   // rectify needs BGRA surface
   const bool have_raw_surfs = nvbuf_raw_left_ && nvbuf_raw_right_;
 
   NvBufSurfTransformParams tp_raw_left{};
@@ -914,6 +1142,13 @@ bool ArducamB0573Node::process_sample_nvbuf(GstBuffer * buf, const rclcpp::Time 
     // BGRA is a single packed plane; -1 == 0 here but is more explicit.
     NvBufSurfaceSyncForCpu(nvbuf_raw_left_,  0, -1);
     NvBufSurfaceSyncForCpu(nvbuf_raw_right_, 0, -1);
+
+    // ── GPU lens-distortion rectification (CUDA bilinear remap) ─────────────
+    // Reads mappedAddr.addr[0] (now CPU-coherent), remaps via CUDA kernel,
+    // writes the rectified pixels back to mappedAddr.addr[0].  Downstream
+    // publish_visual_side and make_nitros_image see the rectified BGRA surface.
+    if (rectify_left_  && d_rect_map_x_left_)  apply_rect_bgra(nvbuf_raw_left_,  true);
+    if (rectify_right_ && d_rect_map_x_right_) apply_rect_bgra(nvbuf_raw_right_, false);
   }
 
   // ── Always publish camera_info ────────────────────────────────────────────

@@ -56,6 +56,7 @@
 // rclcpp::Publisher<NitrosImage>; convert_to_custom() creates a lifecycle-managed
 // GXF VideoBuffer without any cudaMalloc or NitrosImageBuilder involvement.
 #ifdef HAVE_NVBUF
+#include <cuda_runtime.h>
 #include <nvbufsurface.h>
 #include <nvbufsurftransform.h>
 // NitrosImage TypeAdapter: rclcpp::TypeAdapter<NitrosImage, sensor_msgs::msg::Image>
@@ -120,6 +121,9 @@ private:
   bool        vis_enable_right_{true};         // right_camera.topics.visual_stream.enable
   bool        pub_nitros_left_{true};          // left_camera.topics.nitros_image.enable
   bool        pub_nitros_right_{true};         // right_camera.topics.nitros_image.enable
+  // Lens-distortion rectification (GPU CUDA remap, applied after VIC crop)
+  bool        rectify_left_{false};            // left_camera.rectilinear
+  bool        rectify_right_{false};           // right_camera.rectilinear
   std::string nitros_fmt_left_{"nv12"};       // left_camera.topics.nitros_image.format
   std::string nitros_fmt_right_{"nv12"};      // right_camera.topics.nitros_image.format
   // visual_stream transport and encoding
@@ -258,9 +262,35 @@ private:
   // FIX 2.3: Shared NV12 CPU de-stride buffer — sized eye_w × combined_h × 3/2.
   std::vector<uint8_t> nv12_cpu_staging_;
 
+  // ── GPU rectification resources (CUDA remap, allocated in init_rectification_maps) ──
+  // Lifecycle: allocated alongside NvBufSurfaces, freed in cleanup_nvbuf_surfaces().
+  //
+  // Per frame (when rectify_{left,right}_ are true):
+  //   1. cudaMemcpy2D  VIC-surface-pitch → packed  (H2D or pure device-side depack)
+  //   2. cuda_remap_bgra kernel          packed src → packed dst
+  //   3. cudaMemcpy2D  packed → VIC-surface-pitch  (D2H, write back to mappedAddr)
+  //   4. Downstream publish_visual_side / make_nitros_image reads mappedAddr as normal.
+  cudaStream_t  rect_stream_{nullptr};           // non-blocking CUDA stream for remap
+  float *       d_rect_map_x_left_{nullptr};     // device float[eye_w × h] src-x map
+  float *       d_rect_map_y_left_{nullptr};     // device float[eye_w × h] src-y map
+  float *       d_rect_map_x_right_{nullptr};
+  float *       d_rect_map_y_right_{nullptr};
+  uint8_t *     d_rect_src_left_{nullptr};       // device packed BGRA staging (H2D)
+  uint8_t *     d_rect_src_right_{nullptr};
+  uint8_t *     d_rect_tmp_left_{nullptr};       // device packed BGRA remap output
+  uint8_t *     d_rect_tmp_right_{nullptr};
+
+  // Allocate/free rectification maps once (called from init_nvbuf_surfaces).
+  void init_rectification_maps();
+
   // Allocate NV12 CUDA-device NvBufSurfaces per eye; set use_nvbuf_ = true.
   void init_nvbuf_surfaces();
   void cleanup_nvbuf_surfaces();
+
+  // Apply GPU (CUDA bilinear) rectification to a BGRA NvBufSurface in-place.
+  // Reads mappedAddr.addr[0] (CPU-mapped), remaps via CUDA, writes back.
+  // No-op if the corresponding d_rect_map_x/y arrays are null.
+  void apply_rect_bgra(NvBufSurface * surf, bool is_left);
 
   // Returns true if the VIC path completed successfully; false causes
   // process_sample() to fall through to the CPU path.
