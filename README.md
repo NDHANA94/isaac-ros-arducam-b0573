@@ -250,3 +250,10 @@ Used to populate `sensor_msgs/CameraInfo` on every published frame.
 > **Placeholder values** — replace `fx`, `fy`, `cx`, `cy`, and the distortion coefficients with the results of a proper stereo calibration run before deploying.
 
 ---
+
+
+
+## License
+
+MIT © 2026 WM Nipun Dhananjaya — see [LICENSE](LICENSE) for the full text.
+
