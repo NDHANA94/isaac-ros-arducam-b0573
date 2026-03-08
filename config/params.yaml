@@ -32,7 +32,7 @@ arducam_b0573_node:
         topic_name_prefix: "/arducam/left"
 
         visual_stream:
-          enable: true
+          enable: false
           transport: "compressed"         # raw | compressed
           encoding: "bgr8"                # bgr8 | rgb8
           jpeg_quality: 80                # 0-100        (only used when transport=compressed)

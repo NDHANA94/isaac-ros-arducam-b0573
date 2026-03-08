@@ -54,6 +54,7 @@ extern "C" void cuda_remap_bgra(
 
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
+#include <gst/base/gstbasesink.h>
 #include <gst/video/video.h>
 
 #include <rclcpp_components/register_node_macro.hpp>
@@ -533,6 +534,10 @@ bool ArducamB0573Node::try_build_pipeline(bool nvmm, const std::string & out_fmt
   }
 
   gst_app_sink_set_emit_signals(GST_APP_SINK(appsink_), FALSE);
+  // Disable async preroll: without this the appsink blocks gst_element_get_state()
+  // waiting for a pulled preroll sample, which never arrives because the capture
+  // thread has not started yet — causing every pipeline variant to time out.
+  gst_base_sink_set_async_enabled(GST_BASE_SINK(appsink_), FALSE);
 
   GstStateChangeReturn ret = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
   if (ret == GST_STATE_CHANGE_FAILURE) {
