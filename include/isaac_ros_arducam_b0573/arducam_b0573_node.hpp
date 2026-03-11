@@ -86,6 +86,20 @@ private:
   int fps_;
   std::string pixel_format_;
 
+  // ── Camera V4L2 controls (camera_controls.* params) ───────────────────────
+  // exposure: 0=manual  → brightness sets integration time in µs
+  //           1=auto    → AEC active (sensor default; causes darkening
+  //                       around bright light sources)
+  int  ctrl_exposure_{1};          // camera_controls.exposure_auto (0=manual, 1=auto)
+  int  ctrl_brightness_{33000};    // camera_controls.brightness    (shutter µs, 0–33000)
+  int  ctrl_gain_{0};              // camera_controls.gain          (analogue gain, 0–16)
+  int  ctrl_contrast_{2};          // camera_controls.contrast      (0–4)
+  int  ctrl_saturation_{2};        // camera_controls.saturation    (0–4)
+  int  ctrl_sharpness_{3};         // camera_controls.sharpness     (0–6)
+  int  ctrl_gamma_{0};             // camera_controls.gamma         (0–7)
+  int  ctrl_wb_temperature_{0};    // camera_controls.white_balance_temperature (0–5)
+  int  ctrl_backlight_comp_{6};    // camera_controls.backlight_compensation    (0–8)
+
   // ── Per-camera configuration (left_camera.* / right_camera.* params) ───────
   std::string topic_vis_left_;       // resolved visual_stream topic (<prefix>/image_raw or /image/compressed)
   std::string topic_vis_right_;
@@ -189,6 +203,11 @@ private:
   void build_pipeline();
   void capture_loop();
   void process_sample(GstSample * sample);
+  /// Apply all camera_controls.* params via ioctl(VIDIOC_S_CTRL) directly on
+  /// the V4L2 device fd.  Called after the pipeline reaches PLAYING because the
+  /// Tegra sensor driver resets AEC/AGC to hardware defaults during its own
+  /// NULL→PLAYING init sequence, wiping anything set earlier.
+  void apply_v4l2_controls();
 
   // ── Publishers ────────────────────────────────────────────────────────────
   // visual_stream publishers — one of raw or compressed per side, set by transport param.

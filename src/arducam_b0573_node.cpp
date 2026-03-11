@@ -52,6 +52,10 @@ extern "C" void cuda_remap_bgra(
   int w, int h, cudaStream_t stream);
 #endif
 
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/videodev2.h>
+
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
 #include <gst/base/gstbasesink.h>
@@ -134,11 +138,47 @@ ArducamB0573Node::ArducamB0573Node(const rclcpp::NodeOptions & options)
       std::vector<double>{1,0,0,0, 0,1,0,0, 0,0,1,0});
   }
 
+  // ── Camera V4L2 controls ──────────────────────────────────────────────────
+  // exposure_auto: 0=manual (RECOMMENDED for UAV/outdoor — disables AEC so
+  //   a bright light source no longer darkens the surrounding scene).
+  //                1=auto  (AEC enabled — driver default).
+  // brightness: sensor integration time in µs when exposure_auto=0 (0–33000).
+  //   ~8000 µs is a good starting point for bright outdoor / sunlit conditions.
+  // backlight_compensation: 0=off … 8=max.  In manual-exposure mode set to 0;
+  //   high values bias AEC toward bright highlights and darken surroundings.
+  declare_parameter("camera_controls.exposure_auto",             1);
+  declare_parameter("camera_controls.brightness",                33000);
+  declare_parameter("camera_controls.gain",                      0);
+  declare_parameter("camera_controls.contrast",                  2);
+  declare_parameter("camera_controls.saturation",                2);
+  declare_parameter("camera_controls.sharpness",                 3);
+  declare_parameter("camera_controls.gamma",                     0);
+  declare_parameter("camera_controls.white_balance_temperature", 0);
+  declare_parameter("camera_controls.backlight_compensation",    6);
+
   device_          = get_parameter("device").as_string();
   combined_width_  = get_parameter("width").as_int();
   combined_height_ = get_parameter("height").as_int();
   fps_             = get_parameter("fps").as_int();
   pixel_format_    = get_parameter("pixel_format").as_string();
+
+  // ── Read camera control parameters ───────────────────────────────────────
+  ctrl_exposure_        = get_parameter("camera_controls.exposure_auto").as_int();
+  ctrl_brightness_      = get_parameter("camera_controls.brightness").as_int();
+  ctrl_gain_            = get_parameter("camera_controls.gain").as_int();
+  ctrl_contrast_        = get_parameter("camera_controls.contrast").as_int();
+  ctrl_saturation_      = get_parameter("camera_controls.saturation").as_int();
+  ctrl_sharpness_       = get_parameter("camera_controls.sharpness").as_int();
+  ctrl_gamma_           = get_parameter("camera_controls.gamma").as_int();
+  ctrl_wb_temperature_  = get_parameter("camera_controls.white_balance_temperature").as_int();
+  ctrl_backlight_comp_  = get_parameter("camera_controls.backlight_compensation").as_int();
+
+  RCLCPP_INFO(get_logger(),
+    "Camera controls: exposure_auto=%d brightness=%d gain=%d contrast=%d "
+    "saturation=%d sharpness=%d gamma=%d wb_temp=%d backlight_comp=%d",
+    ctrl_exposure_, ctrl_brightness_, ctrl_gain_, ctrl_contrast_,
+    ctrl_saturation_, ctrl_sharpness_, ctrl_gamma_, ctrl_wb_temperature_,
+    ctrl_backlight_comp_);
 
   // ── Read per-camera visual_stream config ──────────────────────────────────
   frame_id_left_  = get_parameter("left_camera.frame_id").as_string();
@@ -564,7 +604,57 @@ bool ArducamB0573Node::try_build_pipeline(bool nvmm, const std::string & out_fmt
 
   use_nvmm_    = nvmm;
   gst_out_fmt_ = out_fmt;
+
+  // Apply V4L2 controls AFTER the pipeline reaches PLAYING.
+  // The Tegra sensor driver performs its own sensor init during the
+  // NULL→PLAYING transition and resets AEC/AGC to hardware defaults,
+  // so any controls set before this point get overwritten.
+  // Calling ioctl directly here — equivalent to v4l2-ctl — is the only
+  // reliable mechanism on this platform.
+  apply_v4l2_controls();
+
   return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// apply_v4l2_controls()
+// ─────────────────────────────────────────────────────────────────────────────
+void ArducamB0573Node::apply_v4l2_controls()
+{
+  int fd = ::open(device_.c_str(), O_RDWR | O_CLOEXEC);
+  if (fd < 0) {
+    RCLCPP_ERROR(get_logger(), "apply_v4l2_controls: cannot open %s: %s",
+      device_.c_str(), strerror(errno));
+    return;
+  }
+
+  // Helper lambda: set one V4L2 control and log the result.
+  auto set_ctrl = [&](uint32_t id, const char * name, int32_t value) {
+    struct v4l2_control ctrl{};
+    ctrl.id    = id;
+    ctrl.value = value;
+    if (::ioctl(fd, VIDIOC_S_CTRL, &ctrl) < 0) {
+      RCLCPP_WARN(get_logger(), "V4L2 ctrl '%s' = %d  FAILED: %s",
+        name, value, strerror(errno));
+    } else {
+      RCLCPP_INFO(get_logger(), "V4L2 ctrl '%s' = %d  OK", name, value);
+    }
+  };
+
+  // exposure (V4L2_CID_EXPOSURE): 0 = manual, 1 = auto (AEC).
+  // Set FIRST so the driver enables/disables the brightness (shutter-time)
+  // control before we try to write it.
+  set_ctrl(V4L2_CID_EXPOSURE,                  "exposure_auto",              ctrl_exposure_);
+  set_ctrl(V4L2_CID_BRIGHTNESS,                "brightness",                 ctrl_brightness_);
+  set_ctrl(V4L2_CID_GAIN,                      "gain",                       ctrl_gain_);
+  set_ctrl(V4L2_CID_CONTRAST,                  "contrast",                   ctrl_contrast_);
+  set_ctrl(V4L2_CID_SATURATION,                "saturation",                 ctrl_saturation_);
+  set_ctrl(V4L2_CID_SHARPNESS,                 "sharpness",                  ctrl_sharpness_);
+  set_ctrl(V4L2_CID_GAMMA,                     "gamma",                      ctrl_gamma_);
+  set_ctrl(V4L2_CID_WHITE_BALANCE_TEMPERATURE, "white_balance_temperature",  ctrl_wb_temperature_);
+  set_ctrl(V4L2_CID_BACKLIGHT_COMPENSATION,    "backlight_compensation",     ctrl_backlight_comp_);
+
+  ::close(fd);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
